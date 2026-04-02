@@ -43,6 +43,10 @@ VOICEVOX_ONNXRUNTIME_FILENAME=voicevox_core/onnxruntime/lib/voicevox_onnxruntime
 
 3. 起動
 
+v0.1.1 以前はVOICEVOXの初期化がlazyなため使用時に数分間の待ち時間があります。  
+初期化終了後は次回起動以降も高速に起動します。
+
+
 ## 設定
 
 現在の実装では、環境変数（`.env`）から読み込みます。

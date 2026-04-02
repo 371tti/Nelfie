@@ -7,8 +7,8 @@ use std::{
 use log::{debug, info, warn};
 use serenity::all::{
     ActionRowComponent, ActivityData, ChannelId, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, EditMessage, FullEvent, Interaction, Message,
-    VoiceState,
+    CreateInteractionResponseMessage, CreateMessage, EditMessage, FullEvent, GuildId, Interaction,
+    Message, VoiceState,
 };
 use tokio::{sync::mpsc, time::sleep};
 
@@ -126,6 +126,41 @@ async fn handle_voice_state_update(
         return Ok(());
     }
 
+    if left_bot_channel && is_bot_voice_channel_empty(ctx, guild_id, bot_voice_channel) {
+        if let Err(e) = ob_context.voice_system.leave_voice(guild_id).await {
+            warn!("failed to auto-leave empty voice channel: {}", e);
+            return Ok(());
+        }
+
+        if let Some(text_channel) = ob_context.voice_system.config(guild_id).text_channel_id {
+            ob_context
+                .chat_contexts
+                .set_voice_auto_read(text_channel, false);
+            ob_context
+                .voice_system
+                .set_auto_read(guild_id, false, Some(text_channel));
+
+            if let Err(e) = text_channel
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new().content(
+                        "ボイスチャンネルに誰もいなくなったため、自動でVCから切断しました。",
+                    ),
+                )
+                .await
+            {
+                warn!("failed to send auto-leave message to text channel: {}", e);
+            }
+        }
+
+        info!(
+            "Auto-left guild {} voice channel {} because no other users remained",
+            guild_id.get(),
+            bot_voice_channel.get()
+        );
+        return Ok(());
+    }
+
     let Some(text_channel) = ob_context.voice_system.config(guild_id).text_channel_id else {
         return Ok(());
     };
@@ -180,6 +215,25 @@ async fn handle_voice_state_update(
     }
 
     Ok(())
+}
+
+fn is_bot_voice_channel_empty(
+    ctx: &serenity::client::Context,
+    guild_id: GuildId,
+    bot_voice_channel: ChannelId,
+) -> bool {
+    let bot_user_id = ctx.cache.current_user().id;
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return false;
+    };
+
+    !guild.voice_states.iter().any(|(user_id, state)| {
+        if *user_id == bot_user_id {
+            return false;
+        }
+
+        state.channel_id == Some(bot_voice_channel)
+    })
 }
 
 async fn handle_interaction(

@@ -8,7 +8,7 @@ use std::{
 use flate2::read::GzDecoder;
 use log::{info, warn};
 use reqwest::{
-    blocking::Client as HttpClient,
+    Client as HttpClient,
     header::{ACCEPT, AUTHORIZATION, USER_AGENT},
 };
 use serde::Deserialize;
@@ -72,7 +72,7 @@ impl CoreRuntime {
             .map_err(|e| format!("failed to build HTTP client: {e}"))
     }
 
-    fn github_api_get<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {
+    async fn github_api_get<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {
         let client = Self::github_http_client()?;
         let mut req = client
             .get(url)
@@ -85,11 +85,15 @@ impl CoreRuntime {
 
         let response = req
             .send()
+            .await
             .map_err(|e| format!("GitHub API request failed: {e}"))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().unwrap_or_else(|_| "<no body>".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
             return Err(format!(
                 "GitHub API request failed with status {} for '{}': {}",
                 status,
@@ -100,20 +104,21 @@ impl CoreRuntime {
 
         response
             .json::<T>()
+            .await
             .map_err(|e| format!("failed to decode GitHub API response: {e}"))
     }
 
-    fn fetch_release_by_tag(repo: &str, tag: &str) -> Result<GithubRelease, String> {
+    async fn fetch_release_by_tag(repo: &str, tag: &str) -> Result<GithubRelease, String> {
         let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-        Self::github_api_get(&url)
+        Self::github_api_get(&url).await
     }
 
-    fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
+    async fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
         let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-        Self::github_api_get(&url)
+        Self::github_api_get(&url).await
     }
 
-    fn download_asset_bytes(url: &str) -> Result<Vec<u8>, String> {
+    async fn download_asset_bytes(url: &str) -> Result<Vec<u8>, String> {
         let client = Self::github_http_client()?;
         let mut req = client
             .get(url)
@@ -126,11 +131,15 @@ impl CoreRuntime {
 
         let response = req
             .send()
+            .await
             .map_err(|e| format!("asset download request failed: {e}"))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().unwrap_or_else(|_| "<no body>".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
             return Err(format!(
                 "asset download failed with status {} for '{}': {}",
                 status,
@@ -141,6 +150,7 @@ impl CoreRuntime {
 
         response
             .bytes()
+            .await
             .map(|b| b.to_vec())
             .map_err(|e| format!("failed to read downloaded asset bytes: {e}"))
     }
@@ -224,7 +234,7 @@ impl CoreRuntime {
         None
     }
 
-    fn ensure_voicevox_onnxruntime(config: &VoiceCoreConfig) -> Result<(), String> {
+    async fn ensure_voicevox_onnxruntime(config: &VoiceCoreConfig) -> Result<(), String> {
         let configured_path = PathBuf::from(&config.onnxruntime_filename);
         if configured_path.is_file() {
             return Ok(());
@@ -257,7 +267,7 @@ impl CoreRuntime {
             ONNXRUNTIME_BUILDER_REPO
         );
 
-        let release = Self::fetch_latest_release(ONNXRUNTIME_BUILDER_REPO)?;
+        let release = Self::fetch_latest_release(ONNXRUNTIME_BUILDER_REPO).await?;
         let asset_name = Self::select_onnxruntime_asset_name(&release).ok_or_else(|| {
             format!(
                 "no matching ONNX Runtime archive for current platform in release '{}'",
@@ -276,7 +286,7 @@ impl CoreRuntime {
                 )
             })?;
 
-        let archive = Self::download_asset_bytes(&asset.browser_download_url)?;
+        let archive = Self::download_asset_bytes(&asset.browser_download_url).await?;
         Self::extract_tgz_strip_first_dir(&archive, onnxruntime_root)?;
 
         if !configured_path.is_file() {
@@ -357,7 +367,7 @@ impl CoreRuntime {
         Ok(false)
     }
 
-    fn ensure_open_jtalk_dictionary(dict_dir: &Path) -> Result<(), String> {
+    async fn ensure_open_jtalk_dictionary(dict_dir: &Path) -> Result<(), String> {
         if Self::has_open_jtalk_dictionary(dict_dir)? {
             return Ok(());
         }
@@ -381,7 +391,7 @@ impl CoreRuntime {
             dict_dir.display()
         );
 
-        let release = Self::fetch_release_by_tag(OPEN_JTALK_REPO, OPEN_JTALK_TAG)?;
+        let release = Self::fetch_release_by_tag(OPEN_JTALK_REPO, OPEN_JTALK_TAG).await?;
         let asset = release
             .assets
             .iter()
@@ -393,7 +403,7 @@ impl CoreRuntime {
                 )
             })?;
 
-        let archive = Self::download_asset_bytes(&asset.browser_download_url)?;
+        let archive = Self::download_asset_bytes(&asset.browser_download_url).await?;
         let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
         tar.unpack(dict_root).map_err(|e| {
             format!(
@@ -417,7 +427,7 @@ impl CoreRuntime {
         Ok(())
     }
 
-    fn ensure_vvm_models(vvm_dir: &Path) -> Result<(), String> {
+    async fn ensure_vvm_models(vvm_dir: &Path) -> Result<(), String> {
         if Self::has_vvm_assets(vvm_dir)? {
             return Ok(());
         }
@@ -436,7 +446,7 @@ impl CoreRuntime {
             vvm_dir.display()
         );
 
-        let release = Self::fetch_latest_release(VOICEVOX_VVM_REPO)?;
+        let release = Self::fetch_latest_release(VOICEVOX_VVM_REPO).await?;
         let mut downloaded = 0usize;
 
         for asset in &release.assets {
@@ -445,7 +455,7 @@ impl CoreRuntime {
                 continue;
             }
 
-            let bytes = Self::download_asset_bytes(&asset.browser_download_url)?;
+            let bytes = Self::download_asset_bytes(&asset.browser_download_url).await?;
             let out_path = vvm_dir.join(&asset.name);
             std::fs::write(&out_path, bytes)
                 .map_err(|e| format!("failed to write VVM file '{}': {e}", out_path.display()))?;
@@ -453,7 +463,7 @@ impl CoreRuntime {
         }
 
         if let Some(readme) = release.assets.iter().find(|a| a.name == MODELS_README_FILE) {
-            let bytes = Self::download_asset_bytes(&readme.browser_download_url)?;
+            let bytes = Self::download_asset_bytes(&readme.browser_download_url).await?;
             let out_path = models_root.join(MODELS_README_FILE);
             std::fs::write(&out_path, bytes).map_err(|e| {
                 format!(
@@ -464,7 +474,7 @@ impl CoreRuntime {
         }
 
         if let Some(terms) = release.assets.iter().find(|a| a.name == MODELS_TERMS_FILE) {
-            let bytes = Self::download_asset_bytes(&terms.browser_download_url)?;
+            let bytes = Self::download_asset_bytes(&terms.browser_download_url).await?;
             let out_path = models_root.join(MODELS_TERMS_FILE);
             std::fs::write(&out_path, bytes).map_err(|e| {
                 format!("failed to write models terms '{}': {e}", out_path.display())
@@ -493,13 +503,13 @@ impl CoreRuntime {
         Ok(())
     }
 
-    fn ensure_required_assets(config: &VoiceCoreConfig) -> Result<(), String> {
+    async fn ensure_required_assets(config: &VoiceCoreConfig) -> Result<(), String> {
         let dict_dir = PathBuf::from(&config.open_jtalk_dict_dir);
         let vvm_dir = PathBuf::from(&config.vvm_dir);
 
-        Self::ensure_voicevox_onnxruntime(config)?;
-        Self::ensure_open_jtalk_dictionary(&dict_dir)?;
-        Self::ensure_vvm_models(&vvm_dir)?;
+        Self::ensure_voicevox_onnxruntime(config).await?;
+        Self::ensure_open_jtalk_dictionary(&dict_dir).await?;
+        Self::ensure_vvm_models(&vvm_dir).await?;
 
         if vvm_dir
             .file_name()
@@ -686,7 +696,7 @@ impl CoreRuntime {
     }
 
     pub(super) async fn new(config: &VoiceCoreConfig) -> Result<Self, String> {
-        Self::ensure_required_assets(config)?;
+        Self::ensure_required_assets(config).await?;
 
         let ort = Self::load_onnxruntime(config).await?;
         let acceleration = Self::parse_acceleration_mode(&config.acceleration_mode);
