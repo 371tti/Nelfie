@@ -38,7 +38,8 @@ VOICEVOX_OUTPUT_SAMPLING_RATE=48000
 VOICEVOX_PRELOAD_ON_STARTUP=true
 VOICEVOX_OPEN_JTALK_DICT_DIR=voicevox_core/dict/open_jtalk_dic_utf_8-1.11
 VOICEVOX_VVM_DIR=voicevox_core/models/vvms
-VOICEVOX_ONNXRUNTIME_FILENAME=voicevox_core/onnxruntime/lib/voicevox_onnxruntime.dll
+# link-onnxruntime モードではランタイム自動ロードを使わないため通常は未設定
+VOICEVOX_ONNXRUNTIME_FILENAME=
 ```
 
 3. 起動
