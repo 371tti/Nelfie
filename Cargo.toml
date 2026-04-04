@@ -52,6 +52,7 @@ symphonia = { version = "0.5.2", default-features = false, features = [
 ] }
 regex = "1.12.3"
 once_cell = "1.21.4"
+kanalizer = { git = "https://github.com/VOICEVOX/kanalizer.git", package = "kanalizer" }
 
 [profile.release]
 opt-level = 3

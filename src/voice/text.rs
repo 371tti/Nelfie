@@ -1,8 +1,12 @@
 use chrono::{FixedOffset, TimeZone, Utc};
+use kanalizer::{ConvertOptions, Kanalizer};
 use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 use serenity::{
-    all::MessageFlags, cache::Cache, model::channel::Message, utils::{ContentSafeOptions, content_safe}
+    all::MessageFlags,
+    cache::Cache,
+    model::channel::Message,
+    utils::{ContentSafeOptions, content_safe},
 };
 
 static RE_MASKED_LINK: Lazy<Regex> =
@@ -40,6 +44,171 @@ const TTS_SEGMENT_SOFT_LIMIT: usize = 36;
 const TTS_SEGMENT_HARD_LIMIT: usize = 60;
 const TTS_MAX_TOTAL_CHARS: usize = 200;
 
+thread_local! {
+    static EN2KANA_DECODER: EN2KANA = EN2KANA::new();
+}
+
+pub struct EN2KANA {
+    decoder: Kanalizer,
+}
+
+impl EN2KANA {
+    pub fn new() -> Self {
+        Self {
+            decoder: Kanalizer::new(),
+        }
+    }
+
+    fn normalize_ascii_letters(letters: &str) -> String {
+        let mut normalized = String::with_capacity(letters.len() + 4);
+        let mut prev_was_lower = false;
+
+        for ch in letters.bytes() {
+            let is_upper = ch.is_ascii_uppercase();
+            if prev_was_lower && is_upper {
+                normalized.push(' ');
+            }
+
+            normalized.push(char::from(ch.to_ascii_lowercase()));
+            prev_was_lower = ch.is_ascii_lowercase();
+        }
+
+        normalized
+    }
+
+    fn digit_to_kana(digit: u8) -> &'static str {
+        match digit {
+            b'0' => "ゼロ",
+            b'1' => "ワン",
+            b'2' => "ツー",
+            b'3' => "スリー",
+            b'4' => "フォー",
+            b'5' => "ファイブ",
+            b'6' => "シックス",
+            b'7' => "セブン",
+            b'8' => "エイト",
+            b'9' => "ナイン",
+            _ => "",
+        }
+    }
+
+    fn convert_ascii_alnum_run(&self, run: &str, opt: &ConvertOptions) -> Result<String, String> {
+        let bytes = run.as_bytes();
+        let has_alpha = bytes.iter().any(|b| b.is_ascii_alphabetic());
+        if !has_alpha {
+            return Ok(run.to_string());
+        }
+
+        let mut result = String::with_capacity(run.len() + 8);
+        let mut i = 0;
+
+        while i < bytes.len() {
+            if bytes[i].is_ascii_alphabetic() {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+
+                let normalized = Self::normalize_ascii_letters(&run[start..i]);
+                let converted = self
+                    .decoder
+                    .convert(&normalized, opt)
+                    .map_err(|e| e.to_string())?;
+                result.push_str(&converted);
+                continue;
+            }
+
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+
+            for digit in run[start..i].bytes() {
+                result.push_str(Self::digit_to_kana(digit));
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn convert(&self, src: &str, opt: Option<ConvertOptions>) -> Result<String, String> {
+        let opt = opt.unwrap_or_default();
+        let mut result = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut cursor = 0;
+        let mut i = 0;
+
+        while i < bytes.len() {
+            if bytes[i].is_ascii_alphanumeric() {
+                if cursor < i {
+                    result.push_str(&src[cursor..i]);
+                }
+
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+
+                let converted = self.convert_ascii_alnum_run(&src[start..i], &opt)?;
+                result.push_str(&converted);
+                cursor = i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        if cursor < src.len() {
+            result.push_str(&src[cursor..]);
+        }
+
+        Ok(result)
+    }
+}
+
+/// 1番初めに適用
+/// 読み上げるべきかDiscordMsgのFlagsや内容を見て判断する
+pub fn build_tts_text_from_message(cache: &Cache, msg: &Message) -> Option<String> {
+    // 先頭 ! / / はコマンド扱いで無視
+    if msg.content.starts_with('!') || msg.content.starts_with('/') {
+        return None;
+    }
+
+    if msg
+        .flags
+        .map(|flags| flags.contains(MessageFlags::SUPPRESS_NOTIFICATIONS))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // serenity 側で mention 系をまず人間向け文字列へ
+    let safe = if let Some(guild_id) = msg.guild_id {
+        let options = ContentSafeOptions::default().display_as_member_from(guild_id);
+        content_safe(cache, &msg.content, &options, &msg.mentions)
+    } else {
+        msg.content_safe(cache)
+    };
+
+    let content = normalize_tts_text(&safe);
+
+    let content = if content.is_empty() {
+        if msg.attachments.is_empty() {
+            return None;
+        }
+        "ファイルが送信されました".to_string()
+    } else {
+        content
+    };
+
+    Some(content)
+}
+
+/// 2番目に適用
+/// 辞書適用
 pub fn apply_tts_dictionary(input: &str, entries: &[(String, String)]) -> String {
     if input.is_empty() || entries.is_empty() {
         return input.to_string();
@@ -60,6 +229,101 @@ pub fn apply_tts_dictionary(input: &str, entries: &[(String, String)]) -> String
     out
 }
 
+/// 3番目に適用
+/// Discord のフォーマットを潰す
+pub fn normalize_tts_text(input: &str) -> String {
+    // Discord の見た目に近い順で潰す
+    // code block を spoiler より先に処理すると挙動が自然
+    let mut out = input.to_string();
+
+    // [text](url) -> text
+    out = RE_MASKED_LINK.replace_all(&out, "$1").into_owned();
+
+    // ```...``` -> コードブロック
+    out = RE_CODE_BLOCK
+        .replace_all(&out, "コードブロック")
+        .into_owned();
+
+    // `...` -> コード
+    out = RE_INLINE_CODE.replace_all(&out, "コード").into_owned();
+
+    // ||...|| -> ネタバレあり
+    out = RE_SPOILER
+        .replace_all(&out, |_caps: &Captures| "スポイラー".to_string())
+        .into_owned();
+
+    // </foo:123> / </foo bar:123> -> スラッシュコマンド foo / foo bar
+    out = RE_SLASH_COMMAND
+        .replace_all(&out, |caps: &Captures| {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+            if name.is_empty() {
+                "スラッシュコマンド".to_string()
+            } else {
+                format!("スラッシュコマンド {}", name)
+            }
+        })
+        .into_owned();
+
+    // <:name:id> / <a:name:id> -> 絵文字 name
+    out = RE_CUSTOM_EMOJI
+        .replace_all(&out, |caps: &Captures| {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+            if name.is_empty() {
+                "絵文字".to_string()
+            } else {
+                format!("絵文字 {}", name)
+            }
+        })
+        .into_owned();
+
+    // <t:1618953630:R> -> 相対時刻 / 日時
+    out = RE_TIMESTAMP
+        .replace_all(&out, |caps: &Captures| {
+            let ts = caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok());
+
+            let style = caps.get(2).map(|m| m.as_str());
+
+            match ts {
+                Some(ts) => format_timestamp_for_tts(ts, style),
+                None => "日時".to_string(),
+            }
+        })
+        .into_owned();
+
+    // <id:guide> など
+    out = RE_GUILD_NAV
+        .replace_all(&out, "サーバー内リンク")
+        .into_owned();
+
+    // URL
+    out = RE_URL.replace_all(&out, "URL").into_owned();
+
+    // Markdown 記号のうち読み上げ不要なもの
+    out = RE_HEADER.replace_all(&out, "").into_owned();
+    out = RE_SUBTEXT.replace_all(&out, "").into_owned();
+    out = RE_BLOCKQUOTE.replace_all(&out, "").into_owned();
+    out = RE_LIST.replace_all(&out, "").into_owned();
+
+    // 改行・連続空白を畳む
+    out = RE_WS.replace_all(&out, " ").into_owned();
+    out = out.trim().to_string();
+
+    // OpenJTalk/VOICEVOX で句頭に置くと壊れやすい記号を落とす
+    out = strip_unsafe_head_symbols_for_tts(&out);
+
+    // 最後に英数字連続区間をカナ寄せして読み上げを安定化する
+    out = normalize_ascii_alnum_to_kana(&out);
+
+    if out.chars().count() > TTS_MAX_TOTAL_CHARS {
+        let truncated = out.chars().take(TTS_MAX_TOTAL_CHARS).collect::<String>();
+        return format!("{}、以下省略", truncated);
+    }
+
+    out
+}
+
+/// 4番目に適用
+/// TTS の発話内容として適切な長さで分割する
 pub fn split_tts_segments(input: &str) -> Vec<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -121,130 +385,6 @@ pub fn split_tts_segments(input: &str) -> Vec<String> {
     segments
 }
 
-pub fn build_tts_text_from_message(cache: &Cache, msg: &Message) -> Option<String> {
-    // 先頭 ! / / はコマンド扱いで無視
-    if msg.content.starts_with('!') || msg.content.starts_with('/') {
-        return None;
-    }
-
-    if msg.flags.map(|flags| flags.contains(MessageFlags::SUPPRESS_NOTIFICATIONS)).unwrap_or(false) {
-        return None;
-    }
-
-    // serenity 側で mention 系をまず人間向け文字列へ
-    let safe = if let Some(guild_id) = msg.guild_id {
-        let options = ContentSafeOptions::default().display_as_member_from(guild_id);
-        content_safe(cache, &msg.content, &options, &msg.mentions)
-    } else {
-        msg.content_safe(cache)
-    };
-
-    let content = normalize_tts_text(&safe);
-
-    let content = if content.is_empty() {
-        if msg.attachments.is_empty() {
-            return None;
-        }
-        "ファイルが送信されました".to_string()
-    } else {
-        content
-    };
-
-    Some(content)
-}
-
-pub fn normalize_tts_text(input: &str) -> String {
-    // Discord の見た目に近い順で潰す
-    // code block を spoiler より先に処理すると挙動が自然
-    let mut out = input.to_string();
-
-    // [text](url) -> text
-    out = RE_MASKED_LINK.replace_all(&out, "$1").into_owned();
-
-    // ```...``` -> コードブロック
-    out = RE_CODE_BLOCK
-        .replace_all(&out, "コードブロック")
-        .into_owned();
-
-    // `...` -> コード
-    out = RE_INLINE_CODE.replace_all(&out, "コード").into_owned();
-
-    // ||...|| -> ネタバレあり
-    out = RE_SPOILER
-        .replace_all(&out, |caps: &Captures| {
-            let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
-            if inner.is_empty() {
-                "ネタバレ".to_string()
-            } else {
-                format!("ネタバレあり {}", inner)
-            }
-        })
-        .into_owned();
-
-    // </foo:123> / </foo bar:123> -> スラッシュコマンド foo / foo bar
-    out = RE_SLASH_COMMAND
-        .replace_all(&out, |caps: &Captures| {
-            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
-            if name.is_empty() {
-                "スラッシュコマンド".to_string()
-            } else {
-                format!("スラッシュコマンド {}", name)
-            }
-        })
-        .into_owned();
-
-    // <:name:id> / <a:name:id> -> 絵文字 name
-    out = RE_CUSTOM_EMOJI
-        .replace_all(&out, |caps: &Captures| {
-            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
-            if name.is_empty() {
-                "絵文字".to_string()
-            } else {
-                format!("絵文字 {}", name)
-            }
-        })
-        .into_owned();
-
-    // <t:1618953630:R> -> 相対時刻 / 日時
-    out = RE_TIMESTAMP
-        .replace_all(&out, |caps: &Captures| {
-            let ts = caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok());
-
-            let style = caps.get(2).map(|m| m.as_str());
-
-            match ts {
-                Some(ts) => format_timestamp_for_tts(ts, style),
-                None => "日時".to_string(),
-            }
-        })
-        .into_owned();
-
-    // <id:guide> など
-    out = RE_GUILD_NAV
-        .replace_all(&out, "サーバー内リンク")
-        .into_owned();
-
-    // URL
-    out = RE_URL.replace_all(&out, "URL").into_owned();
-
-    // Markdown 記号のうち読み上げ不要なもの
-    out = RE_HEADER.replace_all(&out, "").into_owned();
-    out = RE_SUBTEXT.replace_all(&out, "").into_owned();
-    out = RE_BLOCKQUOTE.replace_all(&out, "").into_owned();
-    out = RE_LIST.replace_all(&out, "").into_owned();
-
-    // 改行・連続空白を畳む
-    out = RE_WS.replace_all(&out, " ").into_owned();
-    out = out.trim().to_string();
-
-    if out.chars().count() > TTS_MAX_TOTAL_CHARS {
-        let truncated = out.chars().take(TTS_MAX_TOTAL_CHARS).collect::<String>();
-        return format!("{}、以下省略", truncated);
-    }
-
-    out
-}
-
 fn format_timestamp_for_tts(ts: i64, style: Option<&str>) -> String {
     // Discord 自体は各ユーザーの timezone / locale で表示するが、
     // 読み上げは固定表現の方が扱いやすいので JST に寄せる
@@ -293,4 +433,130 @@ fn relative_time_jp(ts: i64) -> String {
     } else {
         format!("{}{}前", value, unit)
     }
+}
+
+fn is_tts_phrase_boundary(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '　'
+            | '\n'
+            | '\r'
+            | '\t'
+            | '、'
+            | '。'
+            | ','
+            | '，'
+            | '.'
+            | '．'
+            | ';'
+            | '；'
+            | ':'
+            | '：'
+            | '!'
+            | '！'
+            | '?'
+            | '？'
+    )
+}
+
+fn is_tts_head_unsafe_symbol(c: char) -> bool {
+    matches!(
+        c,
+        '?' | '？'
+            | '!'
+            | '！'
+            | '_'
+            | 'ー'
+            | '－'
+            | '—'
+            | '―'
+            | '…'
+            | '‥'
+            | '、'
+            | '。'
+            | ','
+            | '，'
+            | '.'
+            | '．'
+            | ';'
+            | '；'
+            | ':'
+            | '：'
+    )
+}
+
+fn is_tts_seed_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '?' | '？'
+                | '!'
+                | '！'
+                | '_'
+                | 'ー'
+                | '－'
+                | '—'
+                | '―'
+                | '…'
+                | '‥'
+                | '、'
+                | '。'
+                | ','
+                | '，'
+                | '.'
+                | '．'
+                | ';'
+                | '；'
+                | ':'
+                | '：'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | '`'
+                | '|'
+        )
+}
+
+fn strip_unsafe_head_symbols_for_tts(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut has_seed_in_phrase = false;
+
+    for c in input.chars() {
+        if c.is_whitespace() {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            has_seed_in_phrase = false;
+            continue;
+        }
+
+        if is_tts_head_unsafe_symbol(c) && !has_seed_in_phrase {
+            continue;
+        }
+
+        out.push(c);
+
+        if is_tts_phrase_boundary(c) {
+            has_seed_in_phrase = false;
+        } else if is_tts_seed_char(c) {
+            has_seed_in_phrase = true;
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn normalize_ascii_alnum_to_kana(input: &str) -> String {
+    EN2KANA_DECODER.with(|decoder| {
+        decoder
+            .convert(input, None)
+            .unwrap_or_else(|_| input.to_string())
+    })
 }
