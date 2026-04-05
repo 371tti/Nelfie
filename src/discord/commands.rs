@@ -18,139 +18,11 @@ use crate::{
     llm::tools::latex::LatexExprRenderTool,
 };
 
-// エラー型（とりあえず Box に投げるスタイルでOK）
+// エラー型 dyn
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 // 毎回書くのがだるいので type alias
 type Context<'a> = poise::Context<'a, NelfieContext, Error>;
-
-async fn send_vc_embed(ctx: &Context<'_>, embed: CreateEmbed) -> Result<(), Error> {
-    match ctx {
-        poise::Context::Application(app_ctx) => {
-            app_ctx
-                .interaction
-                .create_response(
-                    app_ctx.serenity_context,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .embed(embed)
-                            .flags(InteractionResponseFlags::SUPPRESS_NOTIFICATIONS),
-                    ),
-                )
-                .await?;
-            app_ctx
-                .has_sent_initial_response
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        poise::Context::Prefix(prefix_ctx) => {
-            prefix_ctx
-                .msg
-                .channel_id
-                .send_message(
-                    prefix_ctx.serenity_context,
-                    CreateMessage::new()
-                        .embed(embed)
-                        .flags(MessageFlags::SUPPRESS_NOTIFICATIONS),
-                )
-                .await?;
-        }
-    }
-
-    Ok(())
-}
-
-fn vc_error_embed(message: impl Into<String>) -> CreateEmbed {
-    CreateEmbed::new().title("VCエラー").description(message)
-}
-
-fn preview_text(input: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in input.chars().enumerate() {
-        if idx >= max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-    }
-
-    if out.is_empty() {
-        "(empty)".to_string()
-    } else {
-        out
-    }
-}
-
-async fn speak_vc_system_message(ctx: &Context<'_>, guild_id: GuildId, text: impl Into<String>) {
-    let ob_ctx = ctx.data();
-    let channel_id = ctx.channel_id();
-
-    if !ob_ctx.chat_contexts.is_voice_system_read(channel_id) {
-        return;
-    }
-
-    let dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
-    let text = apply_tts_dictionary(&text.into(), &dictionary);
-    let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
-    let parallel_count = ob_ctx.chat_contexts.voice_parallel_count(channel_id);
-
-    if let Err(e) = ob_ctx
-        .voice_system
-        .speak(
-            guild_id,
-            text,
-            SpeakOptions {
-                speaker: user_voice.voice_speaker,
-                speed_scale: user_voice.voice_speed_scale,
-                pitch_scale: user_voice.voice_pitch_scale,
-                pan: user_voice.voice_pan,
-                channel_id,
-                parallel_count,
-            },
-        )
-        .await
-    {
-        warn!("failed to enqueue VC system message: {}", e);
-    }
-}
-
-fn bool_enabled_label(value: bool) -> &'static str {
-    if value { "有効" } else { "無効" }
-}
-
-fn build_vc_mode_label(parallel_count: usize, sequential_capacity: usize) -> String {
-    if parallel_count > 1 {
-        format!("parallel(count={parallel_count})")
-    } else {
-        format!("sequential(queue <= {sequential_capacity})")
-    }
-}
-
-fn build_vc_config_status_voice_message(auto_read: bool, parallel_count: usize) -> String {
-    format!(
-        "現在のVC設定です。システム読み上げは有効、自動読み上げは{}、並列数は{}です。",
-        bool_enabled_label(auto_read),
-        parallel_count
-    )
-}
-
-fn build_vc_config_voice_message(
-    system_read: bool,
-    auto_read: bool,
-    parallel_count: usize,
-) -> String {
-    let mode = if parallel_count > 1 {
-        format!("並列 {}", parallel_count)
-    } else {
-        "逐次".to_string()
-    };
-
-    format!(
-        "VC設定を更新しました。システム読み上げは{}。自動読み上げは{}。読み上げモードは{}です。",
-        bool_enabled_label(system_read),
-        bool_enabled_label(auto_read),
-        mode
-    )
-}
 
 /// ping pong..
 #[poise::command(slash_command, prefix_command)]
@@ -752,15 +624,6 @@ pub async fn vc_config(
         .voice_system
         .set_channel_parallel_count(channel_id, parallel_count);
 
-    if changed && current_system_read && !next_system_read {
-        speak_vc_system_message(
-            &ctx,
-            guild_id,
-            "VC設定を更新します。システム読み上げを無効にします。",
-        )
-        .await;
-    }
-
     if system_read.is_some() {
         ob_ctx
             .chat_contexts
@@ -801,20 +664,11 @@ pub async fn vc_config(
         .field("mode", queue_mode, false);
     send_vc_embed(&ctx, embed).await?;
 
-    if changed && system_read {
+    if system_read {
         speak_vc_system_message(
             &ctx,
             guild_id,
-            build_vc_config_voice_message(system_read, auto_read, parallel_count),
-        )
-        .await;
-    }
-
-    if !changed && system_read {
-        speak_vc_system_message(
-            &ctx,
-            guild_id,
-            build_vc_config_status_voice_message(auto_read, parallel_count),
+            build_vc_config_voice_message(changed, system_read, auto_read, parallel_count),
         )
         .await;
     }
@@ -1022,6 +876,15 @@ pub async fn vc_speaker(
     #[description = "音高 (-1.0〜1.0, 省略時は現状維持)"] pitch: Option<f32>,
     #[description = "左右pan (-1.0=左, 0.0=中央, 1.0=右, 省略時は現状維持)"] pan: Option<f32>,
 ) -> Result<(), Error> {
+    let Some(guild_id) = ctx.guild_id() else {
+        send_vc_embed(
+            &ctx,
+            vc_error_embed("vc_speaker はサーバーチャンネル内でのみ使用できます。"),
+        )
+        .await?;
+        return Ok(());
+    };
+
     let Some(style_id) = voice_catalog::find_style_id(&speaker, &style) else {
         let styles = voice_catalog::styles_for_speaker(&speaker);
         if styles.is_empty() {
@@ -1133,6 +996,8 @@ pub async fn vc_speaker(
         .field("pitch", pitch_text, true)
         .field("pan", pan_text, true);
     send_vc_embed(&ctx, embed).await?;
+
+    speak_vc_system_message(&ctx, guild_id, "話者設定を更新しました").await;
 
     Ok(())
 }
@@ -1291,6 +1156,7 @@ pub async fn vc_status(ctx: Context<'_>) -> Result<(), Error> {
         )
         .field("last_error", last_error, false);
     send_vc_embed(&ctx, embed).await?;
+    speak_vc_system_message(&ctx, guild_id, "VCステータスを表示しました").await;
 
     Ok(())
 }
@@ -1304,4 +1170,129 @@ pub fn log_err(context: &str, err: &(dyn std::error::Error + Send + Sync)) {
         src = s.source();
     }
     error!("error trace end");
+}
+
+async fn send_vc_embed(ctx: &Context<'_>, embed: CreateEmbed) -> Result<(), Error> {
+    match ctx {
+        poise::Context::Application(app_ctx) => {
+            app_ctx
+                .interaction
+                .create_response(
+                    app_ctx.serenity_context,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .embed(embed)
+                            .flags(InteractionResponseFlags::SUPPRESS_NOTIFICATIONS),
+                    ),
+                )
+                .await?;
+            app_ctx
+                .has_sent_initial_response
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        poise::Context::Prefix(prefix_ctx) => {
+            prefix_ctx
+                .msg
+                .channel_id
+                .send_message(
+                    prefix_ctx.serenity_context,
+                    CreateMessage::new()
+                        .embed(embed)
+                        .flags(MessageFlags::SUPPRESS_NOTIFICATIONS),
+                )
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn vc_error_embed(message: impl Into<String>) -> CreateEmbed {
+    CreateEmbed::new().title("VCエラー").description(message)
+}
+
+fn preview_text(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+
+    if out.is_empty() {
+        "(empty)".to_string()
+    } else {
+        out
+    }
+}
+
+async fn speak_vc_system_message(ctx: &Context<'_>, guild_id: GuildId, text: impl Into<String>) {
+    let ob_ctx = ctx.data();
+    let channel_id = ctx.channel_id();
+
+    if !ob_ctx.chat_contexts.is_voice_system_read(channel_id) {
+        return;
+    }
+
+    let dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
+    let text = apply_tts_dictionary(&text.into(), &dictionary);
+    let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
+    let parallel_count = ob_ctx.chat_contexts.voice_parallel_count(channel_id);
+
+    if let Err(e) = ob_ctx
+        .voice_system
+        .speak(
+            guild_id,
+            text,
+            SpeakOptions {
+                speaker: user_voice.voice_speaker,
+                speed_scale: user_voice.voice_speed_scale,
+                pitch_scale: user_voice.voice_pitch_scale,
+                pan: user_voice.voice_pan,
+                channel_id,
+                parallel_count,
+            },
+        )
+        .await
+    {
+        warn!("failed to enqueue VC system message: {}", e);
+    }
+}
+
+fn bool_enabled_label(value: bool) -> &'static str {
+    if value { "有効" } else { "無効" }
+}
+
+fn build_vc_mode_label(parallel_count: usize, sequential_capacity: usize) -> String {
+    if parallel_count > 1 {
+        format!("parallel(count={parallel_count})")
+    } else {
+        format!("sequential(queue <= {sequential_capacity})")
+    }
+}
+
+fn build_vc_config_voice_message(
+    is_updating: bool,
+    system_read: bool,
+    auto_read: bool,
+    parallel_count: usize,
+) -> String {
+    let action = if is_updating { "VC設定を更新しました。" } else { "現在のVC設定です。" };
+    format!(
+        "{}システム読み上げは{}。自動読み上げは{}。読み上げモードは{}です。",
+        action,
+        bool_enabled_label(system_read),
+        bool_enabled_label(auto_read),
+        read_mode_label(parallel_count),
+    )
+}
+
+fn read_mode_label(parallel_count: usize) -> String {
+    if parallel_count > 1 {
+        format!("並列 {}", parallel_count)
+    } else {
+        "逐次".to_string()
+    }
 }
