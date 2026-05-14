@@ -1374,8 +1374,8 @@ impl CoreRuntime {
         // Discord向け品質を優先して出力条件を固定する。
         query.output_sampling_rate = self.output_sampling_rate;
         query.output_stereo = false;
-        query.post_phoneme_length = 0.05;
-        query.pre_phoneme_length = 0.05;
+        query.post_phoneme_length = 0.0;
+        query.pre_phoneme_length = 0.0;
 
         if let Some(speed_scale) = speed_scale {
             query.speed_scale = speed_scale;

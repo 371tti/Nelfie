@@ -6,6 +6,7 @@ use std::{
 
 use chrono::{FixedOffset, TimeZone, Utc};
 use kanalizer::{ConvertOptions, Kanalizer};
+use log::warn;
 use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 use serenity::{
@@ -48,9 +49,14 @@ const TTS_SEGMENT_SOFT_LIMIT: usize = 36;
 const TTS_SEGMENT_HARD_LIMIT: usize = 60;
 const TTS_MAX_TOTAL_CHARS: usize = 200;
 const TTS_DICTIONARY_CACHE_LIMIT: usize = 64;
+const DICTIONARY_PRIORITY_GLOBAL: u8 = 1;
+const DICTIONARY_PRIORITY_GUILD: u8 = 2;
+const DICTIONARY_PRIORITY_USER: u8 = 3;
+
+static GLOBAL_TTS_DICTIONARY: Lazy<Vec<(String, String)>> = Lazy::new(load_global_dictionary);
 
 static TTS_DICTIONARY_MATCHER_CACHE: Lazy<
-    Mutex<HashMap<Vec<(String, String)>, Arc<CompiledDictionaryMatcher>>>,
+    Mutex<HashMap<Vec<DictionaryKeyEntry>, Arc<CompiledDictionaryMatcher>>>,
 > = Lazy::new(|| Mutex::new(HashMap::new()));
 
 enum DictionaryMatcherKind {
@@ -64,35 +70,157 @@ struct CompiledDictionaryMatcher {
     replacements: HashMap<String, String>,
 }
 
-fn build_dictionary_cache_key(entries: &[(String, String)]) -> Vec<(String, String)> {
-    let mut key = Vec::with_capacity(entries.len());
+#[derive(Clone)]
+struct DictionaryItem {
+    source: String,
+    target: String,
+    priority: u8,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct DictionaryKeyEntry {
+    source: String,
+    target: String,
+    priority: u8,
+}
+
+#[derive(Clone)]
+struct PatternEntry {
+    source: String,
+    target: String,
+    priority: u8,
+    len: usize,
+}
+
+fn load_global_dictionary() -> Vec<(String, String)> {
+    let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "\\global-dict.json"));
+    let map: HashMap<String, String> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse global-dict.json: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::with_capacity(map.len());
+    for (source, target) in map {
+        let source = source.trim();
+        let target = target.trim();
+        if source.is_empty() || target.is_empty() {
+            continue;
+        }
+
+        out.push((source.to_owned(), target.to_owned()));
+    }
+
+    out
+}
+
+fn append_dictionary_items(
+    items: &mut Vec<DictionaryItem>,
+    seen: &mut HashSet<String>,
+    entries: &[(String, String)],
+    priority: u8,
+) {
     for (source, target) in entries {
         let source = source.trim();
         let target = target.trim();
         if source.is_empty() || target.is_empty() {
             continue;
         }
-        key.push((source.to_owned(), target.to_owned()));
+
+        if seen.insert(source.to_owned()) {
+            items.push(DictionaryItem {
+                source: source.to_owned(),
+                target: target.to_owned(),
+                priority,
+            });
+        }
     }
+}
+
+fn collect_dictionary_items(
+    global_entries: &[(String, String)],
+    guild_entries: &[(String, String)],
+    user_entries: &[(String, String)],
+) -> Vec<DictionaryItem> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    append_dictionary_items(
+        &mut items,
+        &mut seen,
+        user_entries,
+        DICTIONARY_PRIORITY_USER,
+    );
+    append_dictionary_items(
+        &mut items,
+        &mut seen,
+        guild_entries,
+        DICTIONARY_PRIORITY_GUILD,
+    );
+    append_dictionary_items(
+        &mut items,
+        &mut seen,
+        global_entries,
+        DICTIONARY_PRIORITY_GLOBAL,
+    );
+
+    items
+}
+
+fn build_dictionary_cache_key(items: &[DictionaryItem]) -> Vec<DictionaryKeyEntry> {
+    let mut key = items
+        .iter()
+        .map(|item| DictionaryKeyEntry {
+            source: item.source.clone(),
+            target: item.target.clone(),
+            priority: item.priority,
+        })
+        .collect::<Vec<_>>();
+
+    key.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.priority.cmp(&b.priority))
+    });
+
     key
 }
 
-fn compile_dictionary_matcher(entries: &[(String, String)]) -> CompiledDictionaryMatcher {
-    let mut patterns = Vec::<String>::with_capacity(entries.len() * 2);
-    let mut replacements = HashMap::<String, String>::with_capacity(entries.len() * 2);
-    let mut seen = HashSet::<String>::with_capacity(entries.len() * 2);
+fn compile_dictionary_matcher(items: &[DictionaryItem]) -> CompiledDictionaryMatcher {
+    let mut patterns = Vec::<PatternEntry>::with_capacity(items.len() * 2);
+    let mut replacements = HashMap::<String, String>::with_capacity(items.len() * 2);
+    let mut seen = HashSet::<String>::with_capacity(items.len() * 2);
 
-    for (source, target) in entries {
-        if seen.insert(source.clone()) {
-            patterns.push(source.clone());
-            replacements.insert(source.clone(), target.clone());
+    for item in items {
+        let source = item.source.trim();
+        let target = item.target.trim();
+        if source.is_empty() || target.is_empty() {
+            continue;
+        }
+
+        if seen.insert(source.to_owned()) {
+            patterns.push(PatternEntry {
+                source: source.to_owned(),
+                target: target.to_owned(),
+                priority: item.priority,
+                len: source.chars().count(),
+            });
+            replacements.insert(source.to_owned(), target.to_owned());
         }
 
         if source.as_bytes().iter().any(|b| b.is_ascii_alphabetic()) {
             let normalized = normalize_ascii_alnum_to_kana(source);
-            if !normalized.is_empty() && normalized != *source && seen.insert(normalized.clone()) {
-                patterns.push(normalized.clone());
-                replacements.insert(normalized, target.clone());
+            if !normalized.is_empty() && normalized != source && seen.insert(normalized.clone()) {
+                patterns.push(PatternEntry {
+                    source: normalized.clone(),
+                    target: target.to_owned(),
+                    priority: item.priority,
+                    len: normalized.chars().count(),
+                });
+                replacements.insert(normalized, target.to_owned());
             }
         }
     }
@@ -105,11 +233,8 @@ fn compile_dictionary_matcher(entries: &[(String, String)]) -> CompiledDictionar
     }
 
     if patterns.len() == 1 {
-        let source = patterns[0].clone();
-        let target = replacements
-            .get(&source)
-            .cloned()
-            .unwrap_or_else(|| source.clone());
+        let source = patterns[0].source.clone();
+        let target = patterns[0].target.clone();
 
         return CompiledDictionaryMatcher {
             kind: DictionaryMatcherKind::Single { source, target },
@@ -117,10 +242,16 @@ fn compile_dictionary_matcher(entries: &[(String, String)]) -> CompiledDictionar
         };
     }
 
-    patterns.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    patterns.sort_by(|a, b| {
+        b.len
+            .cmp(&a.len)
+            .then_with(|| b.priority.cmp(&a.priority))
+            .then_with(|| a.source.cmp(&b.source))
+    });
+
     let escaped = patterns
         .iter()
-        .map(|value| regex::escape(value))
+        .map(|value| regex::escape(&value.source))
         .collect::<Vec<_>>();
     let alternation = format!("(?:{})", escaped.join("|"));
 
@@ -131,17 +262,19 @@ fn compile_dictionary_matcher(entries: &[(String, String)]) -> CompiledDictionar
     CompiledDictionaryMatcher { kind, replacements }
 }
 
-fn get_or_build_dictionary_matcher(entries: &[(String, String)]) -> Arc<CompiledDictionaryMatcher> {
+fn get_or_build_dictionary_matcher(items: &[DictionaryItem]) -> Arc<CompiledDictionaryMatcher> {
+    let cache_key = build_dictionary_cache_key(items);
+
     if let Ok(cache) = TTS_DICTIONARY_MATCHER_CACHE.lock()
-        && let Some(found) = cache.get(entries)
+        && let Some(found) = cache.get(&cache_key)
     {
         return Arc::clone(found);
     }
 
-    let compiled = Arc::new(compile_dictionary_matcher(entries));
+    let compiled = Arc::new(compile_dictionary_matcher(items));
 
     if let Ok(mut cache) = TTS_DICTIONARY_MATCHER_CACHE.lock() {
-        if let Some(found) = cache.get(entries) {
+        if let Some(found) = cache.get(&cache_key) {
             return Arc::clone(found);
         }
 
@@ -149,7 +282,7 @@ fn get_or_build_dictionary_matcher(entries: &[(String, String)]) -> Arc<Compiled
             cache.clear();
         }
 
-        cache.insert(entries.to_vec(), Arc::clone(&compiled));
+        cache.insert(cache_key, Arc::clone(&compiled));
     }
 
     compiled
@@ -343,12 +476,53 @@ pub fn apply_tts_dictionary(input: &str, entries: &[(String, String)]) -> String
         return input.to_string();
     }
 
-    let cache_key = build_dictionary_cache_key(entries);
-    if cache_key.is_empty() {
+    let items = collect_dictionary_items(&[], entries, &[]);
+    if items.is_empty() {
         return input.to_string();
     }
 
-    let matcher = get_or_build_dictionary_matcher(&cache_key);
+    let matcher = get_or_build_dictionary_matcher(&items);
+
+    match &matcher.kind {
+        DictionaryMatcherKind::Noop => return input.to_string(),
+        DictionaryMatcherKind::Single { source, target } => {
+            return input.replace(source, target);
+        }
+        DictionaryMatcherKind::Regex(re) => {
+            return match re.replace_all(input, |caps: &Captures| {
+                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+                matcher
+                    .replacements
+                    .get(matched)
+                    .cloned()
+                    .unwrap_or_else(|| matched.to_string())
+            }) {
+                Cow::Borrowed(_) => input.to_string(),
+                Cow::Owned(owned) => owned,
+            };
+        }
+    }
+}
+
+pub fn apply_tts_dictionaries(
+    input: &str,
+    guild_entries: &[(String, String)],
+    user_entries: &[(String, String)],
+) -> String {
+    if input.is_empty() {
+        return input.to_string();
+    }
+
+    if GLOBAL_TTS_DICTIONARY.is_empty() && guild_entries.is_empty() && user_entries.is_empty() {
+        return input.to_string();
+    }
+
+    let items = collect_dictionary_items(&GLOBAL_TTS_DICTIONARY, guild_entries, user_entries);
+    if items.is_empty() {
+        return input.to_string();
+    }
+
+    let matcher = get_or_build_dictionary_matcher(&items);
 
     match &matcher.kind {
         DictionaryMatcherKind::Noop => return input.to_string(),

@@ -16,7 +16,7 @@ use crate::{
     discord::commands::log_err,
     app::context::NelfieContext,
     llm::client::{LMContext, Role},
-    voice::{SpeakOptions, apply_tts_dictionary, build_tts_text_from_message},
+    voice::{SpeakOptions, apply_tts_dictionaries, build_tts_text_from_message},
 };
 
 /// イベントハンドラ
@@ -189,10 +189,13 @@ async fn handle_voice_state_update(
         format!("{} がボイスチャンネルから退出しました。", display_name)
     };
 
-    let dictionary = ob_context
+    let guild_dictionary = ob_context
         .chat_contexts
         .voice_dictionary_entries(text_channel);
-    let phrase = apply_tts_dictionary(&phrase, &dictionary);
+    let user_dictionary = ob_context
+        .user_contexts
+        .voice_dictionary_entries(new.user_id);
+    let phrase = apply_tts_dictionaries(&phrase, &guild_dictionary, &user_dictionary);
     let parallel_count = ob_context.chat_contexts.voice_parallel_count(text_channel);
 
     if let Err(e) = ob_context
@@ -385,10 +388,13 @@ async fn handle_message(
         let pan = user_voice.voice_pan;
 
         if let Some(base_text) = build_tts_text_from_message(&ctx.cache, msg) {
-            let dictionary = ob_context
+            let guild_dictionary = ob_context
                 .chat_contexts
                 .voice_dictionary_entries(channel_id);
-            let text = apply_tts_dictionary(&base_text, &dictionary);
+            let user_dictionary = ob_context
+                .user_contexts
+                .voice_dictionary_entries(msg.author.id);
+            let text = apply_tts_dictionaries(&base_text, &guild_dictionary, &user_dictionary);
             let parallel_count = ob_context.chat_contexts.voice_parallel_count(channel_id);
 
             if let Err(e) = ob_context

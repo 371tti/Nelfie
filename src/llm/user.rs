@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use serenity::all::UserId;
 
 use crate::app::config::Models;
+use crate::llm::channel::{VOICE_DICTIONARY_MAX_ENTRIES, VoiceDictionaryEntry};
 
 const USER_CONTEXTS_STORE_PATH: &str = "data/runtime/user_contexts.json";
 
@@ -25,6 +26,7 @@ pub struct UserContext {
     pub voice_speed_scale: Option<f32>,
     pub voice_pitch_scale: Option<f32>,
     pub voice_pan: Option<f32>,
+    pub voice_dictionary: Vec<VoiceDictionaryEntry>,
 }
 
 impl UserContext {
@@ -37,6 +39,7 @@ impl UserContext {
             voice_speed_scale: None,
             voice_pitch_scale: None,
             voice_pan: None,
+            voice_dictionary: Vec::new(),
         }
     }
 }
@@ -132,6 +135,110 @@ impl UserContexts {
         self.save_to_disk();
     }
 
+    pub fn set_voice_dictionary_entry(
+        &self,
+        user_id: UserId,
+        source: String,
+        target: String,
+    ) -> Result<(usize, bool), String> {
+        let source = source.trim().to_string();
+        let target = target.trim().to_string();
+
+        if source.is_empty() {
+            return Err("'source' must not be empty".to_string());
+        }
+        if target.is_empty() {
+            return Err("'target' must not be empty".to_string());
+        }
+
+        let (count, updated) = {
+            let mut entry = self
+                .contexts
+                .entry(user_id)
+                .or_insert_with(|| UserContext::new(user_id));
+
+            if let Some(existing) = entry
+                .voice_dictionary
+                .iter_mut()
+                .find(|item| item.source == source)
+            {
+                existing.target = target;
+                (entry.voice_dictionary.len(), true)
+            } else {
+                if entry.voice_dictionary.len() >= VOICE_DICTIONARY_MAX_ENTRIES {
+                    return Err(format!(
+                        "voice dictionary limit reached for this user: max {} entries",
+                        VOICE_DICTIONARY_MAX_ENTRIES
+                    ));
+                }
+
+                entry
+                    .voice_dictionary
+                    .push(VoiceDictionaryEntry { source, target });
+                (entry.voice_dictionary.len(), false)
+            }
+        };
+
+        self.save_to_disk();
+        Ok((count, updated))
+    }
+
+    pub fn remove_voice_dictionary_entry(
+        &self,
+        user_id: UserId,
+        source: &str,
+    ) -> Result<(usize, Option<String>), String> {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err("'source' must not be empty".to_string());
+        }
+
+        let (count, removed_target) = {
+            let mut entry = self
+                .contexts
+                .entry(user_id)
+                .or_insert_with(|| UserContext::new(user_id));
+
+            match entry
+                .voice_dictionary
+                .iter()
+                .position(|item| item.source == source)
+            {
+                Some(idx) => {
+                    let removed = entry.voice_dictionary.remove(idx);
+                    (entry.voice_dictionary.len(), Some(removed.target))
+                }
+                None => (entry.voice_dictionary.len(), None),
+            }
+        };
+
+        if removed_target.is_some() {
+            self.save_to_disk();
+        }
+
+        Ok((count, removed_target))
+    }
+
+    pub fn voice_dictionary_entries(&self, user_id: UserId) -> Vec<(String, String)> {
+        self.contexts
+            .get(&user_id)
+            .map(|entry| {
+                entry
+                    .voice_dictionary
+                    .iter()
+                    .map(|item| (item.source.clone(), item.target.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn voice_dictionary_count(&self, user_id: UserId) -> usize {
+        self.contexts
+            .get(&user_id)
+            .map(|entry| entry.voice_dictionary.len())
+            .unwrap_or(0)
+    }
+
     fn save_to_disk(&self) {
         let default_model_name = Models::default().to_string();
         let entries = self
@@ -146,6 +253,7 @@ impl UserContexts {
                     && value.voice_speed_scale.is_none()
                     && value.voice_pitch_scale.is_none()
                     && value.voice_pan.is_none()
+                    && value.voice_dictionary.is_empty()
                 {
                     return None;
                 }
@@ -173,6 +281,17 @@ impl UserContexts {
 
                 if let Some(pan) = value.voice_pan {
                     obj["voice_pan"] = json!(pan);
+                }
+
+                if !value.voice_dictionary.is_empty() {
+                    obj["voice_dictionary"] = json!(value
+                        .voice_dictionary
+                        .iter()
+                        .map(|item| json!({
+                            "source": item.source,
+                            "target": item.target,
+                        }))
+                        .collect::<Vec<Value>>());
                 }
 
                 Some(obj)
@@ -257,6 +376,34 @@ impl UserContexts {
                 .get("voice_pan")
                 .and_then(Value::as_f64)
                 .map(|v| v as f32);
+            let voice_dictionary = ctx
+                .get("voice_dictionary")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let source = item
+                                .get("source")
+                                .or_else(|| item.get("key"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToOwned::to_owned)?;
+
+                            let target = item
+                                .get("target")
+                                .or_else(|| item.get("value"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToOwned::to_owned)?;
+
+                            Some(VoiceDictionaryEntry { source, target })
+                        })
+                        .take(VOICE_DICTIONARY_MAX_ENTRIES)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
             self.contexts.insert(
                 UserId::new(user_id_num),
@@ -268,6 +415,7 @@ impl UserContexts {
                     voice_speed_scale,
                     voice_pitch_scale,
                     voice_pan,
+                    voice_dictionary,
                 },
             );
         }

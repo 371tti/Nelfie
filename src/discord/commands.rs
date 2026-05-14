@@ -1,4 +1,4 @@
-use crate::voice::{SpeakOptions, apply_tts_dictionary, voice_catalog};
+use crate::voice::{SpeakOptions, apply_tts_dictionaries, voice_catalog};
 use std::time::Instant;
 
 use log::{error, info, warn};
@@ -514,11 +514,12 @@ pub async fn vc_say(
         return Ok(());
     }
 
-    let dictionary = ctx
+    let guild_dictionary = ctx
         .data()
         .chat_contexts
         .voice_dictionary_entries(ctx.channel_id());
-    let text = apply_tts_dictionary(&text, &dictionary);
+    let user_dictionary = ctx.data().user_contexts.voice_dictionary_entries(ctx.author().id);
+    let text = apply_tts_dictionaries(&text, &guild_dictionary, &user_dictionary);
     let preview = preview_text(&text, 120);
     let channel_id = ctx.channel_id();
     let parallel_count = ctx.data().chat_contexts.voice_parallel_count(channel_id);
@@ -588,8 +589,9 @@ pub async fn vc_download(
     let channel_id = ctx.channel_id();
     let ob_ctx = ctx.data();
 
-    let dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
-    let text = apply_tts_dictionary(&text, &dictionary);
+    let guild_dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
+    let user_dictionary = ob_ctx.user_contexts.voice_dictionary_entries(ctx.author().id);
+    let text = apply_tts_dictionaries(&text, &guild_dictionary, &user_dictionary);
     let preview = preview_text(&text, 120);
 
     let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
@@ -915,6 +917,119 @@ pub async fn vc_dict_delete(
     Ok(())
 }
 
+/// ユーザーごとの読み上げ辞書を登録/更新します
+#[poise::command(slash_command, prefix_command)]
+pub async fn vc_dict_user(
+    ctx: Context<'_>,
+    #[description = "変換前の語句"] source: String,
+    #[description = "読み上げ時の置換語句"] target: String,
+) -> Result<(), Error> {
+    let Some(guild_id) = ctx.guild_id() else {
+        send_vc_embed(
+            &ctx,
+            vc_error_embed("vc_dict_user はサーバーチャンネル内でのみ使用できます。"),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let user_id = ctx.author().id;
+    let (count, updated) = match ctx
+        .data()
+        .user_contexts
+        .set_voice_dictionary_entry(user_id, source.clone(), target.clone())
+    {
+        Ok(v) => v,
+        Err(e) => {
+            send_vc_embed(&ctx, vc_error_embed(format!("辞書設定に失敗しました: {e}"))).await?;
+            return Ok(());
+        }
+    };
+
+    let action = if updated { "更新" } else { "登録" };
+    let embed = CreateEmbed::new()
+        .title("VCユーザー辞書設定")
+        .description(format!("ユーザー辞書を{}しました。", action))
+        .field("user", format!("<@{}>", user_id.get()), true)
+        .field(
+            "entry_count",
+            format!("{count}/{VOICE_DICTIONARY_MAX_ENTRIES}"),
+            true,
+        )
+        .field("source", preview_text(source.trim(), 120), false)
+        .field("target", preview_text(target.trim(), 120), false);
+    send_vc_embed(&ctx, embed).await?;
+
+    speak_vc_system_message(
+        &ctx,
+        guild_id,
+        format!("ユーザー辞書を{}しました。", action),
+    )
+    .await;
+
+    Ok(())
+}
+
+/// ユーザーごとの読み上げ辞書エントリを削除します
+#[poise::command(slash_command, prefix_command)]
+pub async fn vc_dict_user_delete(
+    ctx: Context<'_>,
+    #[description = "削除する変換前の語句"]
+    #[autocomplete = "autocomplete_vc_dict_user_source"]
+    source: String,
+) -> Result<(), Error> {
+    let Some(guild_id) = ctx.guild_id() else {
+        send_vc_embed(
+            &ctx,
+            vc_error_embed("vc_dict_user_delete はサーバーチャンネル内でのみ使用できます。"),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let user_id = ctx.author().id;
+    let (count, removed_target) = match ctx
+        .data()
+        .user_contexts
+        .remove_voice_dictionary_entry(user_id, &source)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            send_vc_embed(&ctx, vc_error_embed(format!("辞書削除に失敗しました: {e}"))).await?;
+            return Ok(());
+        }
+    };
+
+    let Some(removed_target) = removed_target else {
+        send_vc_embed(
+            &ctx,
+            vc_error_embed(format!(
+                "指定した語句は辞書に存在しません: {}",
+                preview_text(source.trim(), 120)
+            )),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let embed = CreateEmbed::new()
+        .title("VCユーザー辞書削除")
+        .description("ユーザー辞書を削除しました。")
+        .field("user", format!("<@{}>", user_id.get()), true)
+        .field(
+            "entry_count",
+            format!("{count}/{VOICE_DICTIONARY_MAX_ENTRIES}"),
+            true,
+        )
+        .field("source", preview_text(source.trim(), 120), false)
+        .field("target", preview_text(&removed_target, 120), false);
+    send_vc_embed(&ctx, embed).await?;
+
+    speak_vc_system_message(&ctx, guild_id, "ユーザー辞書を削除しました。").await;
+
+    Ok(())
+}
+
 async fn autocomplete_vc_dict_source(ctx: Context<'_>, partial: &str) -> Vec<String> {
     let partial = partial.trim().to_lowercase();
 
@@ -922,6 +1037,32 @@ async fn autocomplete_vc_dict_source(ctx: Context<'_>, partial: &str) -> Vec<Str
         .data()
         .chat_contexts
         .voice_dictionary_entries(ctx.channel_id())
+        .into_iter()
+        .map(|(source, _)| source)
+        .filter(|source| {
+            if partial.is_empty() {
+                return true;
+            }
+
+            let source_lc = source.to_lowercase();
+            source_lc.starts_with(&partial) || source_lc.contains(&partial)
+        })
+        .collect::<Vec<_>>();
+
+    out.sort();
+    out.dedup();
+    out.truncate(25);
+    out
+}
+
+async fn autocomplete_vc_dict_user_source(ctx: Context<'_>, partial: &str) -> Vec<String> {
+    let partial = partial.trim().to_lowercase();
+    let user_id = ctx.author().id;
+
+    let mut out = ctx
+        .data()
+        .user_contexts
+        .voice_dictionary_entries(user_id)
         .into_iter()
         .map(|(source, _)| source)
         .filter(|source| {
@@ -1141,6 +1282,9 @@ pub async fn vc_status(ctx: Context<'_>) -> Result<(), Error> {
     let auto_read = ob_ctx.chat_contexts.is_voice_auto_read(channel_id);
     let system_read = ob_ctx.chat_contexts.is_voice_system_read(channel_id);
     let dict_entries = ob_ctx.chat_contexts.voice_dictionary_count(channel_id);
+    let user_dict_entries = ob_ctx
+        .user_contexts
+        .voice_dictionary_count(ctx.author().id);
     let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
     let user_speaker = user_voice.voice_speaker;
     let speaker_text = user_speaker
@@ -1208,6 +1352,11 @@ pub async fn vc_status(ctx: Context<'_>) -> Result<(), Error> {
         .field(
             "tts_dict_entries(this_channel)",
             format!("{dict_entries}/{VOICE_DICTIONARY_MAX_ENTRIES}"),
+            true,
+        )
+        .field(
+            "tts_dict_entries(user)",
+            format!("{user_dict_entries}/{VOICE_DICTIONARY_MAX_ENTRIES}"),
             true,
         )
         .field(
@@ -1314,8 +1463,9 @@ async fn speak_vc_system_message(ctx: &Context<'_>, guild_id: GuildId, text: imp
         return;
     }
 
-    let dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
-    let text = apply_tts_dictionary(&text.into(), &dictionary);
+    let guild_dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
+    let user_dictionary = ob_ctx.user_contexts.voice_dictionary_entries(ctx.author().id);
+    let text = apply_tts_dictionaries(&text.into(), &guild_dictionary, &user_dictionary);
     let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
     let parallel_count = ob_ctx.chat_contexts.voice_parallel_count(channel_id);
 
