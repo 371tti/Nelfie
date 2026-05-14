@@ -93,7 +93,7 @@ struct PatternEntry {
 }
 
 fn load_global_dictionary() -> Vec<(String, String)> {
-    let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "\\global-dict.json"));
+    let raw = include_str!("../../global-dict.json");
     let map: HashMap<String, String> = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
