@@ -518,7 +518,10 @@ pub async fn vc_say(
         .data()
         .chat_contexts
         .voice_dictionary_entries(ctx.channel_id());
-    let user_dictionary = ctx.data().user_contexts.voice_dictionary_entries(ctx.author().id);
+    let user_dictionary = ctx
+        .data()
+        .user_contexts
+        .voice_dictionary_entries(ctx.author().id);
     let text = apply_tts_dictionaries(&text, &guild_dictionary, &user_dictionary);
     let preview = preview_text(&text, 120);
     let channel_id = ctx.channel_id();
@@ -586,11 +589,17 @@ pub async fn vc_download(
         return Ok(());
     }
 
+    if let poise::Context::Application(app_ctx) = &ctx {
+        app_ctx.defer().await?;
+    }
+
     let channel_id = ctx.channel_id();
     let ob_ctx = ctx.data();
 
     let guild_dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
-    let user_dictionary = ob_ctx.user_contexts.voice_dictionary_entries(ctx.author().id);
+    let user_dictionary = ob_ctx
+        .user_contexts
+        .voice_dictionary_entries(ctx.author().id);
     let text = apply_tts_dictionaries(&text, &guild_dictionary, &user_dictionary);
     let preview = preview_text(&text, 120);
 
@@ -612,11 +621,12 @@ pub async fn vc_download(
     {
         Ok(wav) => wav,
         Err(e) => {
-            send_vc_embed(
-                &ctx,
-                vc_error_embed(format!("音声ファイル生成に失敗しました: {e}")),
-            )
-            .await?;
+            let embed = vc_error_embed(format!("音声ファイル生成に失敗しました: {e}"));
+            if let poise::Context::Application(_) = &ctx {
+                ctx.send(CreateReply::default().embed(embed)).await?;
+            } else {
+                send_vc_embed(&ctx, embed).await?;
+            }
             return Ok(());
         }
     };
@@ -934,11 +944,11 @@ pub async fn vc_dict_user(
     };
 
     let user_id = ctx.author().id;
-    let (count, updated) = match ctx
-        .data()
-        .user_contexts
-        .set_voice_dictionary_entry(user_id, source.clone(), target.clone())
-    {
+    let (count, updated) = match ctx.data().user_contexts.set_voice_dictionary_entry(
+        user_id,
+        source.clone(),
+        target.clone(),
+    ) {
         Ok(v) => v,
         Err(e) => {
             send_vc_embed(&ctx, vc_error_embed(format!("辞書設定に失敗しました: {e}"))).await?;
@@ -1282,9 +1292,7 @@ pub async fn vc_status(ctx: Context<'_>) -> Result<(), Error> {
     let auto_read = ob_ctx.chat_contexts.is_voice_auto_read(channel_id);
     let system_read = ob_ctx.chat_contexts.is_voice_system_read(channel_id);
     let dict_entries = ob_ctx.chat_contexts.voice_dictionary_count(channel_id);
-    let user_dict_entries = ob_ctx
-        .user_contexts
-        .voice_dictionary_count(ctx.author().id);
+    let user_dict_entries = ob_ctx.user_contexts.voice_dictionary_count(ctx.author().id);
     let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
     let user_speaker = user_voice.voice_speaker;
     let speaker_text = user_speaker
@@ -1464,7 +1472,9 @@ async fn speak_vc_system_message(ctx: &Context<'_>, guild_id: GuildId, text: imp
     }
 
     let guild_dictionary = ob_ctx.chat_contexts.voice_dictionary_entries(channel_id);
-    let user_dictionary = ob_ctx.user_contexts.voice_dictionary_entries(ctx.author().id);
+    let user_dictionary = ob_ctx
+        .user_contexts
+        .voice_dictionary_entries(ctx.author().id);
     let text = apply_tts_dictionaries(&text.into(), &guild_dictionary, &user_dictionary);
     let user_voice = ob_ctx.user_contexts.get_or_create(ctx.author().id);
     let parallel_count = ob_ctx.chat_contexts.voice_parallel_count(channel_id);
