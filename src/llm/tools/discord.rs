@@ -3,8 +3,9 @@ use std::str::FromStr;
 use serde_json::json;
 use serenity::all::{
     Builder, ChannelId, ChannelType, CreateMessage, CreateThread, EditMessage, GetMessages,
-    GuildId, Message, MessageId, ReactionType,
+    GuildChannel, GuildId, Message, MessageId, ReactionType,
 };
+use serenity::model::guild::Guild;
 
 use crate::llm::client::{LMTool, Role};
 
@@ -60,6 +61,74 @@ impl DiscordTool {
             ChannelType::Unknown(_) => "unknown",
             _ => "unknown",
         }
+    }
+
+    fn is_voice_channel_type(channel_type: ChannelType) -> bool {
+        channel_type == ChannelType::Voice || channel_type == ChannelType::Stage
+    }
+
+    fn sort_channels(channels: &mut [GuildChannel]) {
+        channels.sort_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then_with(|| a.id.get().cmp(&b.id.get()))
+        });
+    }
+
+    fn build_voice_channel_members(
+        guild: &Guild,
+        channel_id: ChannelId,
+        include_state: bool,
+    ) -> Vec<serde_json::Value> {
+        guild
+            .voice_states
+            .iter()
+            .filter(|(_, state)| state.channel_id == Some(channel_id))
+            .map(|(user_id, state)| {
+                let display_name = guild
+                    .members
+                    .get(user_id)
+                    .map(|m| m.display_name().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+
+                if include_state {
+                    json!({
+                        "user_id": user_id.to_string(),
+                        "display_name": display_name,
+                        "self_mute": state.self_mute,
+                        "self_deaf": state.self_deaf,
+                        "mute": state.mute,
+                        "deaf": state.deaf,
+                    })
+                } else {
+                    json!({
+                        "user_id": user_id.to_string(),
+                        "display_name": display_name,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    fn build_channel_json(
+        channel: GuildChannel,
+        members: Vec<serde_json::Value>,
+        include_parent_id: bool,
+    ) -> serde_json::Value {
+        let mut value = json!({
+            "channel_id": channel.id.to_string(),
+            "name": channel.name,
+            "type": Self::channel_type_name(channel.kind),
+            "position": channel.position,
+            "member_count": members.len(),
+            "members": members,
+        });
+
+        if include_parent_id {
+            value["parent_id"] = json!(channel.parent_id.map(|v| v.to_string()));
+        }
+
+        value
     }
 }
 
@@ -449,51 +518,21 @@ impl LMTool for DiscordTool {
                     .filter(|ch| Self::channel_matches_filter(ch.kind, filter))
                     .collect::<Vec<_>>();
 
-                rows.sort_by(|a, b| {
-                    a.position
-                        .cmp(&b.position)
-                        .then_with(|| a.id.get().cmp(&b.id.get()))
-                });
+                Self::sort_channels(&mut rows);
 
                 let channels_json = rows
                     .into_iter()
                     .map(|ch| {
-                        let members = if include_members
-                            && (ch.kind == ChannelType::Voice || ch.kind == ChannelType::Stage)
-                        {
+                        let members = if include_members && Self::is_voice_channel_type(ch.kind) {
                             guild_ref
                                 .as_ref()
-                                .map(|g| {
-                                    g.voice_states
-                                        .iter()
-                                        .filter(|(_, state)| state.channel_id == Some(ch.id))
-                                        .map(|(user_id, _)| {
-                                            let display_name = g
-                                                .members
-                                                .get(user_id)
-                                                .map(|m| m.display_name().to_string())
-                                                .unwrap_or_else(|| "(unknown)".to_string());
-                                            json!({
-                                                "user_id": user_id.to_string(),
-                                                "display_name": display_name,
-                                            })
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
+                                .map(|g| Self::build_voice_channel_members(g, ch.id, false))
                                 .unwrap_or_default()
                         } else {
                             Vec::new()
                         };
 
-                        json!({
-                            "channel_id": ch.id.to_string(),
-                            "name": ch.name,
-                            "type": Self::channel_type_name(ch.kind),
-                            "position": ch.position,
-                            "parent_id": ch.parent_id.map(|v| v.to_string()),
-                            "members": members,
-                            "member_count": members.len(),
-                        })
+                        Self::build_channel_json(ch, members, true)
                     })
                     .collect::<Vec<_>>();
 
@@ -530,51 +569,21 @@ impl LMTool for DiscordTool {
 
                 let mut voice_channels = channels
                     .into_values()
-                    .filter(|ch| ch.kind == ChannelType::Voice || ch.kind == ChannelType::Stage)
+                    .filter(|ch| Self::is_voice_channel_type(ch.kind))
                     .collect::<Vec<_>>();
 
-                voice_channels.sort_by(|a, b| {
-                    a.position
-                        .cmp(&b.position)
-                        .then_with(|| a.id.get().cmp(&b.id.get()))
-                });
+                Self::sort_channels(&mut voice_channels);
 
                 let channels_json = voice_channels
                     .into_iter()
                     .map(|ch| {
                         let members = if include_members {
-                            guild_ref
-                                .voice_states
-                                .iter()
-                                .filter(|(_, state)| state.channel_id == Some(ch.id))
-                                .map(|(user_id, state)| {
-                                    let display_name = guild_ref
-                                        .members
-                                        .get(user_id)
-                                        .map(|m| m.display_name().to_string())
-                                        .unwrap_or_else(|| "(unknown)".to_string());
-                                    json!({
-                                        "user_id": user_id.to_string(),
-                                        "display_name": display_name,
-                                        "self_mute": state.self_mute,
-                                        "self_deaf": state.self_deaf,
-                                        "mute": state.mute,
-                                        "deaf": state.deaf,
-                                    })
-                                })
-                                .collect::<Vec<_>>()
+                            Self::build_voice_channel_members(&guild_ref, ch.id, true)
                         } else {
                             Vec::new()
                         };
 
-                        json!({
-                            "channel_id": ch.id.to_string(),
-                            "name": ch.name,
-                            "type": Self::channel_type_name(ch.kind),
-                            "position": ch.position,
-                            "member_count": members.len(),
-                            "members": members,
-                        })
+                        Self::build_channel_json(ch, members, false)
                     })
                     .collect::<Vec<_>>();
 

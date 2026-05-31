@@ -18,7 +18,7 @@ use tokio::{
 
 use super::{
     core_runtime::CoreRuntime,
-    text::{normalize_tts_text, split_tts_segments},
+    text::{normalize_tts_text, normalize_tts_text_full, split_tts_segments},
     types::{GuildVoiceConfig, SpeakOptions, SpeakRequest, VoiceCoreConfig},
 };
 
@@ -366,15 +366,26 @@ impl VoiceSystem {
         pitch_scale: Option<f32>,
         pan: Option<f32>,
     ) -> Result<Vec<u8>, String> {
-        let text = normalize_tts_text(&text.into());
+        let text = normalize_tts_text_full(&text.into());
         if text.is_empty() {
             return Err("Text is empty".to_string());
         }
 
         let speed_scale = enforce_min_speed_for_long_text(&text, speed_scale);
-        let wav = self
-            .synthesize(&text, speaker, speed_scale, pitch_scale)
-            .await?;
+        let segments = split_tts_segments(&text);
+        if segments.is_empty() {
+            return Err("Text is empty".to_string());
+        }
+
+        let mut wav_segments = Vec::with_capacity(segments.len());
+        for segment in segments {
+            wav_segments.push(
+                self.synthesize(&segment, speaker, speed_scale, pitch_scale)
+                    .await?,
+            );
+        }
+
+        let wav = concatenate_wav_segments(wav_segments)?;
 
         apply_pan_to_wav(wav, pan.map(|v| v.clamp(-1.0, 1.0)))
     }
@@ -676,6 +687,139 @@ fn apply_pan_to_wav(wav: Vec<u8>, pan: Option<f32>) -> Result<Vec<u8>, String> {
         return Ok(wav);
     }
 
+    let meta = parse_pcm_wav(&wav)?;
+
+    if meta.audio_format != 1 || meta.bits_per_sample != 16 {
+        return Err("pan processing supports only PCM16 WAV".to_string());
+    }
+
+    let left_gain = (1.0 - pan).clamp(0.0, 1.0);
+    let right_gain = (1.0 + pan).clamp(0.0, 1.0);
+
+    if meta.channels == 2 {
+        let mut out = wav;
+        let mut pos = meta.data_start;
+        while pos + 3 < meta.data_end {
+            let left = i16::from_le_bytes([out[pos], out[pos + 1]]);
+            let right = i16::from_le_bytes([out[pos + 2], out[pos + 3]]);
+            let left = scale_pcm16(left, left_gain);
+            let right = scale_pcm16(right, right_gain);
+            out[pos..pos + 2].copy_from_slice(&left.to_le_bytes());
+            out[pos + 2..pos + 4].copy_from_slice(&right.to_le_bytes());
+            pos += 4;
+        }
+        return Ok(out);
+    }
+
+    if meta.channels != 1 {
+        return Err(format!(
+            "pan processing supports only mono/stereo WAV (got {} ch)",
+            meta.channels
+        ));
+    }
+
+    let mut new_data = Vec::with_capacity((meta.data_end - meta.data_start) * 2);
+    let mut pos = meta.data_start;
+    while pos + 1 < meta.data_end {
+        let sample = i16::from_le_bytes([wav[pos], wav[pos + 1]]);
+        let left = scale_pcm16(sample, left_gain);
+        let right = scale_pcm16(sample, right_gain);
+        new_data.extend_from_slice(&left.to_le_bytes());
+        new_data.extend_from_slice(&right.to_le_bytes());
+        pos += 2;
+    }
+
+    let mut out = replace_wav_data(&wav, &meta, &new_data, "pan processing")?;
+
+    write_u16_le(
+        &mut out[meta.fmt_data_start + 2..meta.fmt_data_start + 4],
+        2,
+    );
+    let block_align = 4u16;
+    write_u16_le(
+        &mut out[meta.fmt_data_start + 12..meta.fmt_data_start + 14],
+        block_align,
+    );
+    let byte_rate = meta
+        .sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| "WAV byte rate overflow".to_string())?;
+    write_u32_le(
+        &mut out[meta.fmt_data_start + 8..meta.fmt_data_start + 12],
+        byte_rate,
+    );
+
+    Ok(out)
+}
+
+struct ParsedPcmWav {
+    fmt_data_start: usize,
+    data_chunk_start: usize,
+    data_start: usize,
+    data_end: usize,
+    audio_format: u16,
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+}
+
+fn concatenate_wav_segments(segments: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
+    let mut segments = segments.into_iter();
+    let Some(first) = segments.next() else {
+        return Err("No WAV segments to concatenate".to_string());
+    };
+
+    let first_meta = parse_pcm_wav(&first)?;
+    let mut combined_data = Vec::new();
+    combined_data.extend_from_slice(&first[first_meta.data_start..first_meta.data_end]);
+
+    for wav in segments {
+        let meta = parse_pcm_wav(&wav)?;
+        if meta.audio_format != first_meta.audio_format
+            || meta.channels != first_meta.channels
+            || meta.sample_rate != first_meta.sample_rate
+            || meta.bits_per_sample != first_meta.bits_per_sample
+        {
+            return Err("WAV segments use different audio formats".to_string());
+        }
+
+        combined_data.extend_from_slice(&wav[meta.data_start..meta.data_end]);
+    }
+
+    replace_wav_data(&first, &first_meta, &combined_data, "concatenation")
+}
+
+fn replace_wav_data(
+    wav: &[u8],
+    meta: &ParsedPcmWav,
+    new_data: &[u8],
+    operation: &str,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(
+        wav.len()
+            + new_data
+                .len()
+                .saturating_sub(meta.data_end - meta.data_start),
+    );
+    out.extend_from_slice(&wav[..meta.data_chunk_start + 8]);
+    out.extend_from_slice(new_data);
+    out.extend_from_slice(&wav[meta.data_end..]);
+
+    let new_data_size = u32::try_from(new_data.len())
+        .map_err(|_| format!("WAV data size is too large after {operation}"))?;
+    write_u32_le(
+        &mut out[meta.data_chunk_start + 4..meta.data_chunk_start + 8],
+        new_data_size,
+    );
+
+    let riff_size = u32::try_from(out.len().saturating_sub(8))
+        .map_err(|_| format!("WAV RIFF size is too large after {operation}"))?;
+    write_u32_le(&mut out[4..8], riff_size);
+
+    Ok(out)
+}
+
+fn parse_pcm_wav(wav: &[u8]) -> Result<ParsedPcmWav, String> {
     if wav.len() < 44 {
         return Err("generated WAV is too short".to_string());
     }
@@ -715,22 +859,13 @@ fn apply_pan_to_wav(wav: Vec<u8>, pan: Option<f32>) -> Result<Vec<u8>, String> {
         data_chunk_start.ok_or_else(|| "WAV data chunk not found".to_string())?;
 
     if fmt_chunk_start > data_chunk_start {
-        return Err("unsupported WAV chunk order for pan processing".to_string());
+        return Err("unsupported WAV chunk order".to_string());
     }
 
     let fmt_chunk_size = read_u32_le(&wav[fmt_chunk_start + 4..fmt_chunk_start + 8]) as usize;
     let fmt_data_start = fmt_chunk_start + 8;
     if fmt_chunk_size < 16 || fmt_data_start + fmt_chunk_size > wav.len() {
         return Err("invalid WAV fmt chunk".to_string());
-    }
-
-    let audio_format = read_u16_le(&wav[fmt_data_start..fmt_data_start + 2]);
-    let channels = read_u16_le(&wav[fmt_data_start + 2..fmt_data_start + 4]);
-    let sample_rate = read_u32_le(&wav[fmt_data_start + 4..fmt_data_start + 8]);
-    let bits_per_sample = read_u16_le(&wav[fmt_data_start + 14..fmt_data_start + 16]);
-
-    if audio_format != 1 || bits_per_sample != 16 {
-        return Err("pan processing supports only PCM16 WAV".to_string());
     }
 
     let data_start = data_chunk_start + 8;
@@ -741,69 +876,16 @@ fn apply_pan_to_wav(wav: Vec<u8>, pan: Option<f32>) -> Result<Vec<u8>, String> {
         return Err("invalid WAV data chunk".to_string());
     }
 
-    let left_gain = (1.0 - pan).clamp(0.0, 1.0);
-    let right_gain = (1.0 + pan).clamp(0.0, 1.0);
-
-    if channels == 2 {
-        let mut out = wav;
-        let mut pos = data_start;
-        while pos + 3 < data_end {
-            let left = i16::from_le_bytes([out[pos], out[pos + 1]]);
-            let right = i16::from_le_bytes([out[pos + 2], out[pos + 3]]);
-            let left = scale_pcm16(left, left_gain);
-            let right = scale_pcm16(right, right_gain);
-            out[pos..pos + 2].copy_from_slice(&left.to_le_bytes());
-            out[pos + 2..pos + 4].copy_from_slice(&right.to_le_bytes());
-            pos += 4;
-        }
-        return Ok(out);
-    }
-
-    if channels != 1 {
-        return Err(format!(
-            "pan processing supports only mono/stereo WAV (got {channels} ch)"
-        ));
-    }
-
-    let mut new_data = Vec::with_capacity(data_chunk_size * 2);
-    let mut pos = data_start;
-    while pos + 1 < data_end {
-        let sample = i16::from_le_bytes([wav[pos], wav[pos + 1]]);
-        let left = scale_pcm16(sample, left_gain);
-        let right = scale_pcm16(sample, right_gain);
-        new_data.extend_from_slice(&left.to_le_bytes());
-        new_data.extend_from_slice(&right.to_le_bytes());
-        pos += 2;
-    }
-
-    let mut out = Vec::with_capacity(wav.len() + new_data.len().saturating_sub(data_chunk_size));
-    out.extend_from_slice(&wav[..data_chunk_start + 8]);
-    out.extend_from_slice(&new_data);
-    out.extend_from_slice(&wav[data_end..]);
-
-    let new_data_size = u32::try_from(new_data.len())
-        .map_err(|_| "WAV data size is too large after pan processing".to_string())?;
-    write_u32_le(
-        &mut out[data_chunk_start + 4..data_chunk_start + 8],
-        new_data_size,
-    );
-
-    write_u16_le(&mut out[fmt_data_start + 2..fmt_data_start + 4], 2);
-    let block_align = 4u16;
-    write_u16_le(
-        &mut out[fmt_data_start + 12..fmt_data_start + 14],
-        block_align,
-    );
-    let byte_rate = sample_rate
-        .checked_mul(u32::from(block_align))
-        .ok_or_else(|| "WAV byte rate overflow".to_string())?;
-    write_u32_le(&mut out[fmt_data_start + 8..fmt_data_start + 12], byte_rate);
-
-    let riff_size = u32::try_from(out.len().saturating_sub(8))
-        .map_err(|_| "WAV RIFF size is too large after pan processing".to_string())?;
-    write_u32_le(&mut out[4..8], riff_size);
-
-    Ok(out)
+    Ok(ParsedPcmWav {
+        fmt_data_start,
+        data_chunk_start,
+        data_start,
+        data_end,
+        audio_format: read_u16_le(&wav[fmt_data_start..fmt_data_start + 2]),
+        channels: read_u16_le(&wav[fmt_data_start + 2..fmt_data_start + 4]),
+        sample_rate: read_u32_le(&wav[fmt_data_start + 4..fmt_data_start + 8]),
+        bits_per_sample: read_u16_le(&wav[fmt_data_start + 14..fmt_data_start + 16]),
+    })
 }
 
 fn read_u16_le(bytes: &[u8]) -> u16 {

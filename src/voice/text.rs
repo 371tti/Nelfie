@@ -262,6 +262,33 @@ fn compile_dictionary_matcher(items: &[DictionaryItem]) -> CompiledDictionaryMat
     CompiledDictionaryMatcher { kind, replacements }
 }
 
+fn apply_dictionary_matcher(input: &str, matcher: &CompiledDictionaryMatcher) -> String {
+    match &matcher.kind {
+        DictionaryMatcherKind::Noop => input.to_string(),
+        DictionaryMatcherKind::Single { source, target } => input.replace(source, target),
+        DictionaryMatcherKind::Regex(re) => match re.replace_all(input, |caps: &Captures| {
+            let matched = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+            matcher
+                .replacements
+                .get(matched)
+                .cloned()
+                .unwrap_or_else(|| matched.to_string())
+        }) {
+            Cow::Borrowed(_) => input.to_string(),
+            Cow::Owned(owned) => owned,
+        },
+    }
+}
+
+fn apply_tts_dictionary_items(input: &str, items: Vec<DictionaryItem>) -> String {
+    if input.is_empty() || items.is_empty() {
+        return input.to_string();
+    }
+
+    let matcher = get_or_build_dictionary_matcher(&items);
+    apply_dictionary_matcher(input, &matcher)
+}
+
 fn get_or_build_dictionary_matcher(items: &[DictionaryItem]) -> Arc<CompiledDictionaryMatcher> {
     let cache_key = build_dictionary_cache_key(items);
 
@@ -472,36 +499,7 @@ pub fn build_tts_text_from_message(cache: &Cache, msg: &Message) -> Option<Strin
 /// 2番目に適用
 /// 辞書適用
 pub fn apply_tts_dictionary(input: &str, entries: &[(String, String)]) -> String {
-    if input.is_empty() || entries.is_empty() {
-        return input.to_string();
-    }
-
-    let items = collect_dictionary_items(&[], entries, &[]);
-    if items.is_empty() {
-        return input.to_string();
-    }
-
-    let matcher = get_or_build_dictionary_matcher(&items);
-
-    match &matcher.kind {
-        DictionaryMatcherKind::Noop => return input.to_string(),
-        DictionaryMatcherKind::Single { source, target } => {
-            return input.replace(source, target);
-        }
-        DictionaryMatcherKind::Regex(re) => {
-            return match re.replace_all(input, |caps: &Captures| {
-                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-                matcher
-                    .replacements
-                    .get(matched)
-                    .cloned()
-                    .unwrap_or_else(|| matched.to_string())
-            }) {
-                Cow::Borrowed(_) => input.to_string(),
-                Cow::Owned(owned) => owned,
-            };
-        }
-    }
+    apply_tts_dictionary_items(input, collect_dictionary_items(&[], entries, &[]))
 }
 
 pub fn apply_tts_dictionaries(
@@ -509,45 +507,19 @@ pub fn apply_tts_dictionaries(
     guild_entries: &[(String, String)],
     user_entries: &[(String, String)],
 ) -> String {
-    if input.is_empty() {
-        return input.to_string();
-    }
-
     if GLOBAL_TTS_DICTIONARY.is_empty() && guild_entries.is_empty() && user_entries.is_empty() {
         return input.to_string();
     }
 
-    let items = collect_dictionary_items(&GLOBAL_TTS_DICTIONARY, guild_entries, user_entries);
-    if items.is_empty() {
-        return input.to_string();
-    }
-
-    let matcher = get_or_build_dictionary_matcher(&items);
-
-    match &matcher.kind {
-        DictionaryMatcherKind::Noop => return input.to_string(),
-        DictionaryMatcherKind::Single { source, target } => {
-            return input.replace(source, target);
-        }
-        DictionaryMatcherKind::Regex(re) => {
-            return match re.replace_all(input, |caps: &Captures| {
-                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-                matcher
-                    .replacements
-                    .get(matched)
-                    .cloned()
-                    .unwrap_or_else(|| matched.to_string())
-            }) {
-                Cow::Borrowed(_) => input.to_string(),
-                Cow::Owned(owned) => owned,
-            };
-        }
-    }
+    apply_tts_dictionary_items(
+        input,
+        collect_dictionary_items(&GLOBAL_TTS_DICTIONARY, guild_entries, user_entries),
+    )
 }
 
 /// 3番目に適用
 /// Discord のフォーマットを潰す
-pub fn normalize_tts_text(input: &str) -> String {
+fn normalize_tts_text_with_char_limit(input: &str, max_total_chars: Option<usize>) -> String {
     // Discord の見た目に近い順で潰す
     // code block を spoiler より先に処理すると挙動が自然
     let mut out = input.to_string();
@@ -649,12 +621,22 @@ pub fn normalize_tts_text(input: &str) -> String {
     // 最後に英数字連続区間をカナ寄せして読み上げを安定化する
     out = normalize_ascii_alnum_to_kana(&out);
 
-    if out.chars().count() > TTS_MAX_TOTAL_CHARS {
-        let truncated = out.chars().take(TTS_MAX_TOTAL_CHARS).collect::<String>();
-        return format!("{}、以下省略", truncated);
+    if let Some(max_total_chars) = max_total_chars {
+        if out.chars().count() > max_total_chars {
+            let truncated = out.chars().take(max_total_chars).collect::<String>();
+            return format!("{}、以下省略", truncated);
+        }
     }
 
     out
+}
+
+pub fn normalize_tts_text(input: &str) -> String {
+    normalize_tts_text_with_char_limit(input, Some(TTS_MAX_TOTAL_CHARS))
+}
+
+pub fn normalize_tts_text_full(input: &str) -> String {
+    normalize_tts_text_with_char_limit(input, None)
 }
 
 /// 4番目に適用
@@ -1036,6 +1018,14 @@ mod tests {
     fn decimal_fraction_is_read_digit_by_digit() {
         assert_eq!(normalize_tts_text(".32"), "テンサンニイ");
         assert_eq!(normalize_tts_text("1.32"), "1テンサンニイ");
+    }
+
+    #[test]
+    fn full_normalization_does_not_append_omission_for_long_text() {
+        let input = "あ".repeat(TTS_MAX_TOTAL_CHARS + 10);
+        let out = normalize_tts_text_full(&input);
+
+        assert_eq!(out, input);
     }
 
     #[test]

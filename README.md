@@ -112,7 +112,7 @@ fmtはやってない。
 
 ## Third-party licenses
 
-- KaTeX font のライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) に記載しています。
-- `KaTeX_font` ディレクトリを再配布する場合は、上記ライセンス表記を同梱してください。
+- KaTeX font と Noto Serif JP のライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) に記載しています。
+- `fonts` ディレクトリを再配布する場合は、上記ライセンス表記を同梱してください。
 
 ダウンロードコンテンツはREADMEを含むのでそちらを参照。

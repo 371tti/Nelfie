@@ -11,9 +11,6 @@ pub struct Config {
     pub system_prompt: String,
     pub rale_limit_window_size: u64,
     pub rate_limit_sec_per_cost: u64,
-    pub web_server_host: [u8; 4],
-    pub web_server_local_ip: [u8; 4],
-    pub web_server_port: u16,
     pub admin_users: Vec<u64>,
     pub timeout_millis: u64,
     pub voicevox_default_speaker: u32,
@@ -45,6 +42,7 @@ impl Config {
 あなたの名前はNelfie(ネルフィー)ですよ。
 あと絵文字つかわないで つかうなら顔文字つかうように
 ハイテンションやめておちついてほしい
+数式をユーザーに見せる必要がある場合は latex_expr_render ツールを使って出してください。
 ".to_string());
         let voicevox_default_speaker = std::env::var("VOICEVOX_DEFAULT_SPEAKER")
             .ok()
@@ -89,9 +87,6 @@ impl Config {
             system_prompt,
             rale_limit_window_size: 16200,
             rate_limit_sec_per_cost: 600,
-            web_server_host: [0, 0, 0, 0],
-            web_server_local_ip: [192, 168, 0, 26],
-            web_server_port: 96,
             admin_users: vec![855371530270408725],
             timeout_millis: 100_000,
             voicevox_default_speaker,

@@ -14,29 +14,34 @@ use serenity::all::{ChannelId, CreateAttachment, CreateMessage, MessageId};
 
 use crate::{app::context::NelfieContext, llm::client::LMTool};
 
+const CJK_FONT_FAMILY: &str = "Noto Serif JP";
+const CJK_FONT_STACK: &str = "Noto Serif JP, sans-serif";
+
 static KATEX_FONT_BYTES: &[&[u8]] = &[
-    include_bytes!("../../../KaTeX_font/KaTeX_AMS-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Caligraphic-Bold.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Caligraphic-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Fraktur-Bold.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Fraktur-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Main-Bold.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Main-BoldItalic.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Main-Italic.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Main-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Math-BoldItalic.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Math-Italic.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_SansSerif-Bold.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_SansSerif-Italic.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_SansSerif-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Script-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Size1-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Size2-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Size3-Regular.ttf"),
-    include_bytes!("../../../KaTeX_font/KaTeX_Typewriter-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_AMS-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Caligraphic-Bold.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Caligraphic-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Fraktur-Bold.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Fraktur-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Main-Bold.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Main-BoldItalic.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Main-Italic.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Main-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Math-BoldItalic.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Math-Italic.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_SansSerif-Bold.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_SansSerif-Italic.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_SansSerif-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Script-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Size1-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Size2-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Size3-Regular.ttf"),
+    include_bytes!("../../../fonts/KaTeX_font/KaTeX_Typewriter-Regular.ttf"),
 ];
 
-static KATEX_RENDERER: OnceLock<KaTeX2Png> = OnceLock::new();
+static CJK_FONT_BYTES: &[&[u8]] = &[include_bytes!("../../../fonts/NotoSerifJP-Regular.ttf")];
+
+static RATEX_RENDERER: OnceLock<Ratex2Png> = OnceLock::new();
 
 pub struct LatexExprRenderTool;
 
@@ -45,9 +50,9 @@ impl LatexExprRenderTool {
         LatexExprRenderTool {}
     }
 
-    fn renderer() -> &'static KaTeX2Png {
-        KATEX_RENDERER.get_or_init(|| {
-            KaTeX2Png::new()
+    fn renderer() -> &'static Ratex2Png {
+        RATEX_RENDERER.get_or_init(|| {
+            Ratex2Png::new()
                 .with_scale(2.0)
                 .with_background(tiny_skia::Color::BLACK)
                 .with_foreground(Color::WHITE)
@@ -66,7 +71,7 @@ impl Default for LatexExprRenderTool {
 }
 
 #[derive(Clone)]
-pub struct KaTeX2Png {
+pub struct Ratex2Png {
     fontdb: Arc<usvg::fontdb::Database>,
     scale: f32,
     background: tiny_skia::Color,
@@ -74,13 +79,13 @@ pub struct KaTeX2Png {
     layout_options: LayoutOptions,
 }
 
-impl Default for KaTeX2Png {
+impl Default for Ratex2Png {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KaTeX2Png {
+impl Ratex2Png {
     pub fn new() -> Self {
         let fontdb = build_katex_fontdb();
         let layout_options = LayoutOptions::default().with_color(Color::WHITE);
@@ -124,7 +129,7 @@ impl KaTeX2Png {
         let layout_box = layout(&ast, &self.layout_options);
         let display_list = to_display_list(&layout_box);
         let svg = render_to_svg(&display_list, &self.svg_options);
-        Ok(svg)
+        Ok(apply_cjk_font_family(svg))
     }
 
     pub fn render_png_vec(&self, input: &str) -> Result<Vec<u8>> {
@@ -168,12 +173,21 @@ impl KaTeX2Png {
 fn build_katex_fontdb() -> Arc<usvg::fontdb::Database> {
     let mut db = usvg::fontdb::Database::new();
 
-    for &bytes in KATEX_FONT_BYTES {
+    for &bytes in KATEX_FONT_BYTES.iter().chain(CJK_FONT_BYTES.iter()) {
         let shared: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(StaticFontData(bytes));
         db.load_font_source(usvg::fontdb::Source::Binary(shared));
     }
 
+    db.set_sans_serif_family(CJK_FONT_FAMILY);
+
     Arc::new(db)
+}
+
+fn apply_cjk_font_family(svg: String) -> String {
+    svg.replace(
+        r#"font-family="sans-serif""#,
+        &format!(r#"font-family="{CJK_FONT_STACK}""#),
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,7 +206,7 @@ impl LMTool for LatexExprRenderTool {
     }
 
     fn description(&self) -> String {
-        "Render LaTeX expressions to images and send to Discord.".to_string()
+        "Render LaTeX expressions to images and send to Discord. Use this whenever you need to present a mathematical expression or formula to the user instead of emitting raw LaTeX in chat.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {

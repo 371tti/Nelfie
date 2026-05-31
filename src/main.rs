@@ -4,7 +4,7 @@ use nelfie::app::context::NelfieContext;
 async fn main() {
     dotenv::dotenv().ok();
     env_logger::try_init_from_env(
-        env_logger::Env::default().default_filter_or("info,tracing::span=off"),
+        env_logger::Env::default().default_filter_or("info,serenity::http=off,tracing::span=off"),
     )
     .unwrap_or(());
     rustls::crypto::aws_lc_rs::default_provider()

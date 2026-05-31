@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
 };
@@ -350,9 +350,56 @@ impl LMContext {
     }
 
     pub fn trim_len(&mut self) {
+        self.drop_incomplete_tool_pairs();
+
         while self.buf.len() > self.max_len {
-            self.buf.pop_front();
+            self.pop_oldest_history_group();
+            self.drop_incomplete_tool_pairs();
         }
+    }
+
+    fn pop_oldest_history_group(&mut self) {
+        let Some(front) = self.buf.front() else {
+            return;
+        };
+
+        if let Some(call_id) = function_tool_call_id(front)
+            .or_else(|| function_tool_output_call_id(front))
+            .map(ToOwned::to_owned)
+        {
+            self.buf
+                .retain(|item| !is_function_tool_pair_item(item, &call_id));
+            return;
+        }
+
+        self.buf.pop_front();
+    }
+
+    fn drop_incomplete_tool_pairs(&mut self) {
+        let call_ids = self
+            .buf
+            .iter()
+            .filter_map(function_tool_call_id)
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+        let output_ids = self
+            .buf
+            .iter()
+            .filter_map(function_tool_output_call_id)
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+
+        self.buf.retain(|item| {
+            if let Some(call_id) = function_tool_call_id(item) {
+                return output_ids.contains(call_id);
+            }
+
+            if let Some(call_id) = function_tool_output_call_id(item) {
+                return call_ids.contains(call_id);
+            }
+
+            true
+        });
     }
 
     pub fn add_text(&mut self, text: String, role: Role) {
@@ -455,8 +502,32 @@ impl LMContext {
 fn is_history_item(item: &InputItem) -> bool {
     matches!(
         item,
-        InputItem::EasyMessage(_) | InputItem::Item(Item::Message(_))
+        InputItem::EasyMessage(_)
+            | InputItem::Item(
+                Item::Message(_) | Item::FunctionCall(_) | Item::FunctionCallOutput(_)
+            )
     )
+}
+
+fn function_tool_call_id(item: &InputItem) -> Option<&str> {
+    if let InputItem::Item(Item::FunctionCall(call)) = item {
+        Some(&call.call_id)
+    } else {
+        None
+    }
+}
+
+fn function_tool_output_call_id(item: &InputItem) -> Option<&str> {
+    if let InputItem::Item(Item::FunctionCallOutput(output)) = item {
+        Some(&output.call_id)
+    } else {
+        None
+    }
+}
+
+fn is_function_tool_pair_item(item: &InputItem, call_id: &str) -> bool {
+    function_tool_call_id(item) == Some(call_id)
+        || function_tool_output_call_id(item) == Some(call_id)
 }
 
 fn extract_text_from_item(item: &InputItem) -> Option<String> {

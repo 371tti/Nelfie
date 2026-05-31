@@ -2,7 +2,7 @@
 
 ## KaTeX fonts
 
-Applies to files in this repository under the KaTeX_font directory.
+Applies to files in this repository under the `fonts/KaTeX_font` directory.
 
 The MIT License (MIT)
 
@@ -25,3 +25,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Noto Serif JP
+
+Applies to `fonts/NotoSerifJP-*.ttf`.
+
+Noto Serif JP is licensed under the SIL Open Font License, Version 1.1.
+Copyright belongs to the Noto Project Authors.
