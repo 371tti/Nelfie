@@ -1,3 +1,4 @@
+pub mod cron;
 pub mod discord;
 pub mod get_time;
 pub mod latex;

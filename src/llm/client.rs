@@ -12,8 +12,8 @@ use async_openai::{
         CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
         FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, InputContent,
         InputImageContent, InputItem, InputMessage, InputParam, InputRole, Item, MessageItem,
-        MessageType, OutputItem, OutputMessage, OutputMessageContent, Reasoning,
-        ResponseStreamEvent, SummaryPart, Tool, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
+        MessageType, OutputItem, OutputMessageContent, Reasoning, ResponseStreamEvent, SummaryPart,
+        Tool, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
     },
 };
 use log::{debug, error, info, warn};
@@ -96,11 +96,19 @@ impl LMClient {
                 .build()?;
 
             let mut stream = self.client.responses().create_stream(request).await?;
+            let mut response_output_items = Vec::new();
 
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(err) => {
+                        if let Some(stream_err) = stream_error_from_deserialize_error(&err) {
+                            state_send(stream_err.to_string());
+                            return Err(
+                                Box::new(stream_err) as Box<dyn std::error::Error + Send + Sync>
+                            );
+                        }
+
                         if should_ignore_stream_deserialize_error(&err) {
                             warn!(
                                 "Ignored known web_search_call stream schema mismatch: {}",
@@ -150,28 +158,42 @@ impl LMClient {
 
                     ResponseStreamEvent::ResponseOutputItemDone(e) => match e.item {
                         OutputItem::Message(output_message) => {
-                            let text = extract_output_message_text(&output_message);
-                            if !text.is_empty() {
-                                delta_context.add_text(text, Role::Assistant);
-                            }
+                            response_output_items.push((
+                                e.output_index,
+                                InputItem::Item(Item::Message(MessageItem::Output(output_message))),
+                            ));
                         }
                         OutputItem::FunctionCall(function_tool_call) => {
                             state_send(format!("Function tool call: {}", function_tool_call.name));
-                            delta_context.add_input_item(Item::FunctionCall(function_tool_call));
+                            response_output_items.push((
+                                e.output_index,
+                                InputItem::Item(Item::FunctionCall(function_tool_call)),
+                            ));
                         }
                         OutputItem::FileSearchCall(file_search_tool_call) => {
-                            delta_context
-                                .add_input_item(Item::FileSearchCall(file_search_tool_call));
+                            response_output_items.push((
+                                e.output_index,
+                                InputItem::Item(Item::FileSearchCall(file_search_tool_call)),
+                            ));
                         }
                         OutputItem::WebSearchCall(web_search_tool_call) => {
                             state_send("OpenAI browser(web search) in progress...".to_string());
-                            delta_context.add_input_item(Item::WebSearchCall(web_search_tool_call));
+                            response_output_items.push((
+                                e.output_index,
+                                InputItem::Item(Item::WebSearchCall(web_search_tool_call)),
+                            ));
                         }
                         OutputItem::ComputerCall(computer_tool_call) => {
-                            delta_context.add_input_item(Item::ComputerCall(computer_tool_call));
+                            response_output_items.push((
+                                e.output_index,
+                                InputItem::Item(Item::ComputerCall(computer_tool_call)),
+                            ));
                         }
                         OutputItem::Reasoning(reasoning) => {
-                            delta_context.add_input_item(Item::Reasoning(reasoning));
+                            response_output_items.push((
+                                e.output_index,
+                                InputItem::Item(Item::Reasoning(reasoning)),
+                            ));
                         }
                         other => {
                             warn!("Unhandled output item: {:?}", other);
@@ -207,6 +229,11 @@ impl LMClient {
                         debug!("Unhandled stream event: {:?}", other);
                     }
                 }
+            }
+
+            response_output_items.sort_by_key(|(output_index, _)| *output_index);
+            for (_, item) in response_output_items {
+                delta_context.buf.push_back(item);
             }
 
             let mut outputs = Vec::new();
@@ -272,6 +299,40 @@ impl LMClient {
     }
 }
 
+fn stream_error_from_deserialize_error(err: &OpenAIError) -> Option<io::Error> {
+    let OpenAIError::JSONDeserialize(_, body) = err else {
+        return None;
+    };
+
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("type").and_then(|v| v.as_str()) != Some("error") {
+        return None;
+    }
+
+    let error = value.get("error")?;
+    let error_type = error
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_error");
+    let code = error
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_code");
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("OpenAI stream returned an error event");
+    let sequence = value
+        .get("sequence_number")
+        .and_then(|v| v.as_i64())
+        .map(|seq| format!(", seq {seq}"))
+        .unwrap_or_default();
+
+    Some(io::Error::other(format!(
+        "OpenAI stream error ({error_type}/{code}{sequence}): {message}"
+    )))
+}
+
 fn should_ignore_stream_deserialize_error(err: &OpenAIError) -> bool {
     let OpenAIError::JSONDeserialize(parse_err, body) = err else {
         return false;
@@ -283,18 +344,6 @@ fn should_ignore_stream_deserialize_error(err: &OpenAIError) -> bool {
     }
 
     body.contains("\"type\":\"response.output_item.added\"") && body.contains("\"web_search_call\"")
-}
-
-fn extract_output_message_text(output_message: &OutputMessage) -> String {
-    output_message
-        .content
-        .iter()
-        .filter_map(|content| match content {
-            OutputMessageContent::OutputText(text) => Some(text.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<String>>()
-        .join("")
 }
 
 /// コンテキスト実態
@@ -328,7 +377,9 @@ impl LMContext {
     }
 
     pub fn generate_context(&self) -> InputParam {
-        InputParam::Items(self.buf.iter().cloned().collect())
+        let mut sanitized = self.clone();
+        sanitized.sanitize_tool_history();
+        InputParam::Items(sanitized.buf.into())
     }
 
     pub fn generate_context_with(&self, additional: &LMContext) -> InputParam {
@@ -336,7 +387,12 @@ impl LMContext {
         for item in additional.buf.iter() {
             combined.push_back(item.clone());
         }
-        InputParam::Items(combined.into())
+        let mut sanitized = LMContext {
+            buf: combined,
+            max_len: self.max_len,
+        };
+        sanitized.sanitize_tool_history();
+        InputParam::Items(sanitized.buf.into())
     }
 
     pub fn extend(&mut self, other: &LMContext) {
@@ -350,11 +406,11 @@ impl LMContext {
     }
 
     pub fn trim_len(&mut self) {
-        self.drop_incomplete_tool_pairs();
+        self.sanitize_tool_history();
 
         while self.buf.len() > self.max_len {
             self.pop_oldest_history_group();
-            self.drop_incomplete_tool_pairs();
+            self.sanitize_tool_history();
         }
     }
 
@@ -362,6 +418,15 @@ impl LMContext {
         let Some(front) = self.buf.front() else {
             return;
         };
+
+        if let Some(reasoning_id) = reasoning_item_id(front).map(ToOwned::to_owned) {
+            let call_ids = self.reasoning_group_call_ids(&reasoning_id);
+            self.buf.retain(|item| {
+                reasoning_item_id(item) != Some(reasoning_id.as_str())
+                    && !function_tool_pair_matches_any(item, &call_ids)
+            });
+            return;
+        }
 
         if let Some(call_id) = function_tool_call_id(front)
             .or_else(|| function_tool_output_call_id(front))
@@ -373,6 +438,12 @@ impl LMContext {
         }
 
         self.buf.pop_front();
+    }
+
+    fn sanitize_tool_history(&mut self) {
+        self.drop_incomplete_tool_pairs();
+        self.drop_function_calls_missing_required_reasoning();
+        self.drop_incomplete_tool_pairs();
     }
 
     fn drop_incomplete_tool_pairs(&mut self) {
@@ -400,6 +471,63 @@ impl LMContext {
 
             true
         });
+    }
+
+    fn drop_function_calls_missing_required_reasoning(&mut self) {
+        let mut invalid_call_ids = HashSet::new();
+        let mut current_reasoning = false;
+
+        for item in self.buf.iter() {
+            if reasoning_item_id(item).is_some() {
+                current_reasoning = true;
+                continue;
+            }
+
+            if is_message_item(item) {
+                current_reasoning = false;
+                continue;
+            }
+
+            if let Some(call) = function_tool_call(item)
+                && function_call_requires_reasoning(call)
+                && !current_reasoning
+            {
+                invalid_call_ids.insert(call.call_id.clone());
+            }
+        }
+
+        if invalid_call_ids.is_empty() {
+            return;
+        }
+
+        self.buf
+            .retain(|item| !function_tool_pair_matches_any(item, &invalid_call_ids));
+    }
+
+    fn reasoning_group_call_ids(&self, reasoning_id: &str) -> HashSet<String> {
+        let mut call_ids = HashSet::new();
+        let mut in_group = false;
+
+        for item in self.buf.iter() {
+            if reasoning_item_id(item) == Some(reasoning_id) {
+                in_group = true;
+                continue;
+            }
+
+            if !in_group {
+                continue;
+            }
+
+            if reasoning_item_id(item).is_some() || is_message_item(item) {
+                break;
+            }
+
+            if let Some(call_id) = function_tool_call_id(item) {
+                call_ids.insert(call_id.to_string());
+            }
+        }
+
+        call_ids
     }
 
     pub fn add_text(&mut self, text: String, role: Role) {
@@ -504,17 +632,39 @@ fn is_history_item(item: &InputItem) -> bool {
         item,
         InputItem::EasyMessage(_)
             | InputItem::Item(
-                Item::Message(_) | Item::FunctionCall(_) | Item::FunctionCallOutput(_)
+                Item::Message(_)
+                    | Item::Reasoning(_)
+                    | Item::FunctionCall(_)
+                    | Item::FunctionCallOutput(_)
             )
     )
 }
 
-fn function_tool_call_id(item: &InputItem) -> Option<&str> {
-    if let InputItem::Item(Item::FunctionCall(call)) = item {
-        Some(&call.call_id)
+fn is_message_item(item: &InputItem) -> bool {
+    matches!(
+        item,
+        InputItem::EasyMessage(_) | InputItem::Item(Item::Message(_))
+    )
+}
+
+fn reasoning_item_id(item: &InputItem) -> Option<&str> {
+    if let InputItem::Item(Item::Reasoning(reasoning)) = item {
+        Some(&reasoning.id)
     } else {
         None
     }
+}
+
+fn function_tool_call(item: &InputItem) -> Option<&FunctionToolCall> {
+    if let InputItem::Item(Item::FunctionCall(call)) = item {
+        Some(call)
+    } else {
+        None
+    }
+}
+
+fn function_tool_call_id(item: &InputItem) -> Option<&str> {
+    function_tool_call(item).map(|call| call.call_id.as_str())
 }
 
 fn function_tool_output_call_id(item: &InputItem) -> Option<&str> {
@@ -528,6 +678,16 @@ fn function_tool_output_call_id(item: &InputItem) -> Option<&str> {
 fn is_function_tool_pair_item(item: &InputItem, call_id: &str) -> bool {
     function_tool_call_id(item) == Some(call_id)
         || function_tool_output_call_id(item) == Some(call_id)
+}
+
+fn function_tool_pair_matches_any(item: &InputItem, call_ids: &HashSet<String>) -> bool {
+    function_tool_call_id(item)
+        .or_else(|| function_tool_output_call_id(item))
+        .is_some_and(|call_id| call_ids.contains(call_id))
+}
+
+fn function_call_requires_reasoning(call: &FunctionToolCall) -> bool {
+    call.id.as_deref().is_some_and(|id| id.starts_with("fc_"))
 }
 
 fn extract_text_from_item(item: &InputItem) -> Option<String> {
@@ -590,4 +750,131 @@ pub trait LMTool: Send + Sync {
         args: serde_json::Value,
         ob_ctx: NelfieContext,
     ) -> Result<String, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::ReasoningItem;
+
+    fn reasoning_item(id: &str) -> InputItem {
+        InputItem::Item(Item::Reasoning(ReasoningItem {
+            id: id.to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+            status: None,
+        }))
+    }
+
+    fn function_call_item(call_id: &str, item_id: Option<&str>) -> InputItem {
+        InputItem::Item(Item::FunctionCall(FunctionToolCall {
+            arguments: "{}".to_string(),
+            call_id: call_id.to_string(),
+            namespace: None,
+            name: "test-tool".to_string(),
+            id: item_id.map(ToOwned::to_owned),
+            status: None,
+        }))
+    }
+
+    fn function_output_item(call_id: &str) -> InputItem {
+        InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutput::Text("ok".to_string()),
+            id: None,
+            status: None,
+        }))
+    }
+
+    fn input_items(input: InputParam) -> Vec<InputItem> {
+        match input {
+            InputParam::Items(items) => items,
+            InputParam::Text(_) => panic!("expected item input"),
+        }
+    }
+
+    #[test]
+    fn extend_preserves_reasoning_for_function_call_history() {
+        let mut delta = LMContext::new();
+        delta.buf.push_back(reasoning_item("rs_1"));
+        delta
+            .buf
+            .push_back(function_call_item("call_1", Some("fc_1")));
+        delta.buf.push_back(function_output_item("call_1"));
+
+        let mut history = LMContext::new();
+        history.extend(&delta);
+
+        assert!(
+            history
+                .buf
+                .iter()
+                .any(|item| reasoning_item_id(item) == Some("rs_1"))
+        );
+        assert!(
+            history
+                .buf
+                .iter()
+                .any(|item| function_tool_call_id(item) == Some("call_1"))
+        );
+        assert!(
+            history
+                .buf
+                .iter()
+                .any(|item| function_tool_output_call_id(item) == Some("call_1"))
+        );
+    }
+
+    #[test]
+    fn generate_context_drops_required_reasoning_call_when_reasoning_is_missing() {
+        let mut history = LMContext::new();
+        history
+            .buf
+            .push_back(function_call_item("call_1", Some("fc_1")));
+        history.buf.push_back(function_output_item("call_1"));
+
+        let items = input_items(history.generate_context());
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn generate_context_keeps_function_call_without_openai_item_id() {
+        let mut history = LMContext::new();
+        history.buf.push_back(function_call_item("call_1", None));
+        history.buf.push_back(function_output_item("call_1"));
+
+        let items = input_items(history.generate_context());
+
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn trim_drops_reasoning_tool_group_together() {
+        let mut history = LMContext::new();
+        history.set_max_len(2);
+        history.buf.push_back(reasoning_item("rs_1"));
+        history
+            .buf
+            .push_back(function_call_item("call_1", Some("fc_1")));
+        history.buf.push_back(function_output_item("call_1"));
+        history.add_text("later".to_string(), Role::User);
+
+        history.trim_len();
+
+        assert!(
+            history
+                .buf
+                .iter()
+                .all(|item| reasoning_item_id(item) != Some("rs_1"))
+        );
+        assert!(
+            history
+                .buf
+                .iter()
+                .all(|item| function_tool_call_id(item) != Some("call_1"))
+        );
+        assert_eq!(history.get_result(), "later");
+    }
 }

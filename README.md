@@ -80,6 +80,9 @@ CHAT BOT:
 - `/model`: 使用する OpenAI モデルを選択
 - `/rate_config`: レート制限の設定(管理者のみ)
 - `/set_system_prompt`: システムプロンプトの設定(管理者のみ)
+- `/cron <cron> <prompt>`: 実行したチャンネルに、cron 表記で定期実行プロンプトを登録
+- `/cron_test [id]`: 登録済み cron を時刻に関係なく即時実行
+- `/del_cron <id>`: 登録済み cron を削除
 
 VC / TTS:
 
@@ -92,6 +95,8 @@ VC / TTS:
 - `/vc_speaker ...`: 話者, スタイル, 音程, 速さ, パンの設定を行います。
 - `/vc_status`: 現在の VC 状態と VOICEVOX 設定を表示します。
 - `/vc_config ...`: 読み上げの詳細設定を行います。(自動読み上げ, システム読み上げ, 並列読み上げ)
+
+cron は実行環境のローカル時刻で、標準的な 5 フィールド表記（例: `*/30 * * * *`）を使います。prefix command では cron 表記を `"*/30 * * * *"` のように引用してください。AI も `cron-tool` で cron の作成・一覧・削除を行えます。cron 実行は bot 自身の guild 単位のユーザー状態として扱われるため、bot に対する `/rate_config` はそのサーバー内の cron 実行にも適用されます。
 
 ## 開発用チェック
 

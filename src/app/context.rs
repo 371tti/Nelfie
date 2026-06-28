@@ -17,11 +17,11 @@ use songbird::SerenityInit;
 use tokio::task::AbortHandle;
 
 use crate::{
-    app::config::Config,
+    app::{config::Config, cron::CronScheduler},
     discord::commands::{
-        clear, disable, enable, model, ping, rate_config, set_system_prompt, tex_expr, vc_autoread,
-        vc_config, vc_dict, vc_dict_delete, vc_dict_user, vc_dict_user_delete, vc_download,
-        vc_join, vc_leave, vc_say, vc_speaker, vc_status,
+        clear, cron, cron_test, del_cron, disable, enable, model, ping, rate_config,
+        set_system_prompt, tex_expr, vc_autoread, vc_config, vc_dict, vc_dict_delete, vc_dict_user,
+        vc_dict_user_delete, vc_download, vc_join, vc_leave, vc_say, vc_speaker, vc_status,
     },
     discord::events::event_handler,
     llm::channel::ChatContexts,
@@ -43,6 +43,7 @@ pub struct NelfieContext {
     pub tools: Arc<HashMap<String, Box<dyn LMTool>>>,
     pub discord_client: Arc<DiscordContextWrapper>,
     pub pending_modals: Arc<DashMap<String, tools::modal_builder::PendingModalSpec>>,
+    pub cron_scheduler: Arc<CronScheduler>,
     pub responding_channels: Arc<DashMap<ChannelId, bool>>,
     pub active_responses: Arc<DashMap<ChannelId, ActiveResponse>>,
     pub response_seq: Arc<AtomicU64>,
@@ -106,6 +107,7 @@ impl NelfieContext {
         let lm_client = LMClient::new(OpenAIClient::with_config(openai_config));
         let tools: HashMap<String, Box<dyn LMTool>> = vec![
             Box::new(tools::get_time::GetTime::new()) as Box<dyn LMTool>,
+            Box::new(tools::cron::CronTool::new()) as Box<dyn LMTool>,
             Box::new(tools::discord::DiscordTool::new()) as Box<dyn LMTool>,
             Box::new(tools::latex::LatexExprRenderTool::new()) as Box<dyn LMTool>,
             Box::new(tools::modal_builder::ModalBuilderTool::new()) as Box<dyn LMTool>,
@@ -124,6 +126,7 @@ impl NelfieContext {
             tools: Arc::new(tools),
             discord_client: Arc::new(DiscordContextWrapper::lazy()),
             pending_modals: Arc::new(DashMap::new()),
+            cron_scheduler: Arc::new(CronScheduler::new()),
             responding_channels: Arc::new(DashMap::new()),
             active_responses: Arc::new(DashMap::new()),
             response_seq: Arc::new(AtomicU64::new(1)),
@@ -148,6 +151,9 @@ impl NelfieContext {
                     model(),
                     tex_expr(),
                     rate_config(),
+                    cron(),
+                    cron_test(),
+                    del_cron(),
                     set_system_prompt(),
                     vc_join(),
                     vc_leave(),
@@ -184,6 +190,7 @@ impl NelfieContext {
                     if let Some(songbird_manager) = songbird::get(ctx).await {
                         ob_ctx.voice_system.set_songbird(songbird_manager);
                     }
+                    ob_ctx.cron_scheduler.start(ctx.clone(), ob_ctx.clone());
 
                     poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                     println!("Bot is ready!");
@@ -218,6 +225,7 @@ impl NelfieContext {
         self.active_responses.clear();
         self.responding_channels.clear();
         self.pending_modals.clear();
+        self.cron_scheduler.stop();
         self.voice_system.clear_all();
 
         self.response_seq.store(1, Ordering::Relaxed);
