@@ -5,7 +5,7 @@ use crate::{
     llm::channel::{
         VOICE_DICTIONARY_MAX_ENTRIES, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX,
     },
-    llm::client::LMTool,
+    llm::tool::LMTool,
     voice::{SpeakOptions, apply_tts_dictionary, voice_catalog},
 };
 

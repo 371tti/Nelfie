@@ -1,2 +1,13 @@
+pub mod bot;
+pub mod client;
+pub mod command_registry;
 pub mod commands;
+pub(crate) mod ephemeral;
 pub mod events;
+pub(crate) mod images;
+pub(crate) mod interactions;
+pub(crate) mod logging;
+pub(crate) mod message_delivery;
+pub(crate) mod message_events;
+pub mod responses;
+pub(crate) mod voice_events;

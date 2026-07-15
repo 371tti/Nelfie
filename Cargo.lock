@@ -3216,7 +3216,6 @@ dependencies = [
 name = "nelfie"
 version = "0.1.9"
 dependencies = [
- "anyhow",
  "async-openai",
  "async-trait",
  "chrono",
@@ -5835,7 +5834,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.4",

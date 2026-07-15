@@ -5,7 +5,14 @@ edition = "2024"
 
 [dependencies]
 env_logger = "0.11"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "fs",
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 async-trait = "0.1.89"
 async-openai = { version = "0.34", features = ["responses"] }
 serenity = { version = "0.12", default-features = false, features = [
@@ -24,7 +31,6 @@ dashmap = "6.1.0"
 dotenv = "0.15.0"
 chrono = "0.4.44"
 chrono-tz = "0.10.4"
-anyhow = "1"
 flate2 = "1"
 reqwest = { version = "0.13.2", default-features = false, features = [
     "json",

@@ -1,4 +1,9 @@
-pub mod client;
 pub mod channel;
-pub mod user;
+pub mod client;
+pub mod compaction;
+pub mod context;
+pub mod models;
+pub mod prompt;
+pub mod tool;
 pub mod tools;
+pub mod user;

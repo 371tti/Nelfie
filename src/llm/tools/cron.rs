@@ -3,7 +3,7 @@ use std::str::FromStr;
 use serde_json::json;
 use serenity::all::{ChannelId, GuildId};
 
-use crate::{app::context::NelfieContext, llm::client::LMTool};
+use crate::{app::context::NelfieContext, llm::tool::LMTool};
 
 pub struct CronTool;
 

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -9,25 +9,16 @@ use std::{
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use dashmap::DashMap;
 use log::info;
-use serenity::{
-    Client as DiscordClient,
-    all::{ChannelId, GatewayIntents},
-};
-use songbird::SerenityInit;
+use serenity::all::ChannelId;
 use tokio::task::AbortHandle;
 
 use crate::{
     app::{config::Config, cron::CronScheduler},
-    discord::commands::{
-        clear, cron, cron_test, del_cron, disable, enable, model, ping, rate_config,
-        set_system_prompt, tex_expr, vc_autoread, vc_config, vc_dict, vc_dict_delete, vc_dict_user,
-        vc_dict_user_delete, vc_download, vc_join, vc_leave, vc_say, vc_speaker, vc_status,
-    },
-    discord::events::event_handler,
+    discord::client::DiscordClientContext,
     llm::channel::ChatContexts,
-    llm::client::{LMClient, LMTool},
     llm::tools,
     llm::user::UserContexts,
+    llm::{client::LMClient, tool::LMTool},
     voice::{VoiceCoreConfig, VoiceSystem},
 };
 
@@ -41,8 +32,7 @@ pub struct NelfieContext {
     pub user_contexts: Arc<UserContexts>,
     pub voice_system: Arc<VoiceSystem>,
     pub tools: Arc<HashMap<String, Box<dyn LMTool>>>,
-    pub discord_client: Arc<DiscordContextWrapper>,
-    pub pending_modals: Arc<DashMap<String, tools::modal_builder::PendingModalSpec>>,
+    pub discord_client: Arc<DiscordClientContext>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub responding_channels: Arc<DashMap<ChannelId, bool>>,
     pub active_responses: Arc<DashMap<ChannelId, ActiveResponse>>,
@@ -53,37 +43,6 @@ pub struct NelfieContext {
 pub struct ActiveResponse {
     pub request_id: u64,
     pub abort_handle: AbortHandle,
-}
-
-/// DiscordContext を全体共有するための頭の悪いラッパー
-pub struct DiscordContextWrapper {
-    pub inner: RwLock<Option<Arc<DisabledContextWrapperInner>>>,
-}
-
-impl DiscordContextWrapper {
-    pub fn open(&self) -> Arc<DisabledContextWrapperInner> {
-        self.inner
-            .read()
-            .expect("RWlock")
-            .clone()
-            .expect("inisializing")
-            .clone()
-    }
-    pub fn lazy() -> DiscordContextWrapper {
-        DiscordContextWrapper {
-            inner: RwLock::new(None),
-        }
-    }
-    pub fn set(&self, ctx: Arc<DisabledContextWrapperInner>) {
-        let mut w = self.inner.write().expect("RWlock");
-        *w = Some(ctx);
-    }
-}
-
-// 上のinner
-pub struct DisabledContextWrapperInner {
-    pub http: Arc<serenity::http::Http>,
-    pub cache: Arc<serenity::cache::Cache>,
 }
 
 impl NelfieContext {
@@ -102,20 +61,9 @@ impl NelfieContext {
             },
         );
 
-        // ツールの定義
         let openai_config = OpenAIConfig::new().with_api_key(config.openai_api_key.clone());
         let lm_client = LMClient::new(OpenAIClient::with_config(openai_config));
-        let tools: HashMap<String, Box<dyn LMTool>> = vec![
-            Box::new(tools::get_time::GetTime::new()) as Box<dyn LMTool>,
-            Box::new(tools::cron::CronTool::new()) as Box<dyn LMTool>,
-            Box::new(tools::discord::DiscordTool::new()) as Box<dyn LMTool>,
-            Box::new(tools::latex::LatexExprRenderTool::new()) as Box<dyn LMTool>,
-            Box::new(tools::modal_builder::ModalBuilderTool::new()) as Box<dyn LMTool>,
-            Box::new(tools::voicevox::VoicevoxTool::new()) as Box<dyn LMTool>,
-        ]
-        .into_iter()
-        .map(|tool| (tool.name(), tool))
-        .collect();
+        let tools = tools::registry();
 
         NelfieContext {
             lm_client: Arc::new(lm_client),
@@ -124,8 +72,7 @@ impl NelfieContext {
             user_contexts: Arc::new(UserContexts::new()),
             voice_system: Arc::new(voice_system),
             tools: Arc::new(tools),
-            discord_client: Arc::new(DiscordContextWrapper::lazy()),
-            pending_modals: Arc::new(DashMap::new()),
+            discord_client: Arc::new(DiscordClientContext::default()),
             cron_scheduler: Arc::new(CronScheduler::new()),
             responding_channels: Arc::new(DashMap::new()),
             active_responses: Arc::new(DashMap::new()),
@@ -137,94 +84,12 @@ impl NelfieContext {
         self.voice_system.initialize_on_startup().await
     }
 
-    pub async fn start_discord(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Starting Discord bot...");
-
-        let ob_ctx = self.clone();
-        let framework = poise::Framework::builder()
-            .options(poise::FrameworkOptions {
-                commands: vec![
-                    ping(),
-                    enable(),
-                    clear(),
-                    disable(),
-                    model(),
-                    tex_expr(),
-                    rate_config(),
-                    cron(),
-                    cron_test(),
-                    del_cron(),
-                    set_system_prompt(),
-                    vc_join(),
-                    vc_leave(),
-                    vc_say(),
-                    vc_download(),
-                    vc_config(),
-                    vc_autoread(),
-                    vc_dict(),
-                    vc_dict_delete(),
-                    vc_dict_user(),
-                    vc_dict_user_delete(),
-                    vc_speaker(),
-                    vc_status(),
-                ],
-                prefix_options: poise::PrefixFrameworkOptions {
-                    prefix: Some("!".into()),
-                    ..Default::default()
-                },
-                event_handler: |ctx, event, framework, data| {
-                    Box::pin(event_handler(ctx, event, framework, data))
-                },
-                ..Default::default()
-            })
-            .setup(move |ctx, _ready, framework| {
-                let ob_ctx = ob_ctx.clone();
-                Box::pin(async move {
-                    ob_ctx
-                        .discord_client
-                        .set(Arc::new(DisabledContextWrapperInner {
-                            http: ctx.http.clone(),
-                            cache: ctx.cache.clone(),
-                        }));
-
-                    if let Some(songbird_manager) = songbird::get(ctx).await {
-                        ob_ctx.voice_system.set_songbird(songbird_manager);
-                    }
-                    ob_ctx.cron_scheduler.start(ctx.clone(), ob_ctx.clone());
-
-                    poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                    println!("Bot is ready!");
-                    Ok(ob_ctx)
-                })
-            })
-            .build();
-
-        let intents = GatewayIntents::GUILDS
-            | GatewayIntents::GUILD_MESSAGES
-            | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::GUILD_MESSAGE_REACTIONS
-            | GatewayIntents::GUILD_VOICE_STATES
-            | GatewayIntents::MESSAGE_CONTENT;
-
-        let discord_client = DiscordClient::builder(self.config.discord_token.clone(), intents)
-            .register_songbird()
-            .framework(framework);
-
-        tokio::spawn(async move {
-            let mut c = discord_client.await.expect("Error creating client");
-            c.start().await.expect("Error starting client");
-        });
-
-        Ok(())
-    }
-
     pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for active in self.active_responses.iter() {
             active.abort_handle.abort();
         }
         self.active_responses.clear();
         self.responding_channels.clear();
-        self.pending_modals.clear();
         self.cron_scheduler.stop();
         self.voice_system.clear_all();
 

@@ -2,12 +2,15 @@ use std::str::FromStr;
 
 use serde_json::json;
 use serenity::all::{
-    Builder, ChannelId, ChannelType, CreateMessage, CreateThread, EditMessage, GetMessages,
-    GuildChannel, GuildId, Message, MessageId, ReactionType,
+    Builder, ChannelId, ChannelType, CreateMessage, CreateThread, EditInteractionResponse,
+    EditMessage, GetMessages, GuildChannel, GuildId, Message, MessageId, ReactionType, UserId,
 };
 use serenity::model::guild::Guild;
 
-use crate::llm::client::{LMTool, Role};
+use crate::{
+    discord::ephemeral::current_ephemeral_interaction,
+    llm::{context::Role, tool::LMTool},
+};
 
 pub struct DiscordTool;
 
@@ -145,7 +148,7 @@ impl LMTool for DiscordTool {
     }
 
     fn description(&self) -> String {
-        "Interact with Discord: add/remove reactions, create threads, send/edit/fetch/search messages, and inspect channels/voice presence. Important: when you use send_message, the text is already posted to Discord, so do not repeat the same body again in a normal assistant reply; only send a short confirmation if needed.".to_string()
+        "Interact with Discord: add/remove reactions, create threads, send/edit/fetch/search messages, send ephemeral interaction messages visible only to the current modal respondent, and inspect channels/voice presence. Important: when you use send_message or send_ephemeral_message, the text is already posted to Discord, so do not repeat the same body again in a normal assistant reply.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -160,6 +163,7 @@ impl LMTool for DiscordTool {
                         "remove_reaction",
                         "create_thread",
                         "send_message",
+                        "send_ephemeral_message",
                         "edit_message",
                         "fetch_message",
                         "search_messages",
@@ -175,6 +179,10 @@ impl LMTool for DiscordTool {
                 "channel_id": {
                     "type": "string",
                     "description": "ID of the target channel. Required for message/reaction/thread operations. Optional filter for list_voice_members."
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "ID of the target user. Optional for send_ephemeral_message; if provided, it must match the current modal respondent. Discord only permits this operation while handling an interaction such as a modal submission."
                 },
                 "message_id": {
                     "type": "string",
@@ -195,7 +203,7 @@ impl LMTool for DiscordTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Message content. Used by: send_message, edit_message. For send_message, this body is already published to Discord immediately, so do not repeat it again in a separate assistant message."
+                    "description": "Message content. Used by: send_message, send_ephemeral_message, edit_message. For send_message/send_ephemeral_message, this body is already published to Discord immediately, so do not repeat it again in a separate assistant message."
                 },
                 "reply_to": {
                     "type": "string",
@@ -382,6 +390,48 @@ impl LMTool for DiscordTool {
                     "message_id": msg.id.to_string(),
                     "content_length": msg.content.chars().count(),
                     "note": "already_posted_to_discord_do_not_repeat_body",
+                });
+
+                Ok(result.to_string())
+            }
+
+            // --------------------
+            // Send ephemeral interaction message to the current modal respondent
+            // --------------------
+            "send_ephemeral_message" => {
+                let content = Self::get_str_arg(&args, "content")?;
+                let user_id = Self::get_opt_str_arg(&args, "user_id")
+                    .map(|raw| UserId::from_str(raw).map_err(|e| format!("Invalid 'user_id': {e}")))
+                    .transpose()?;
+
+                let modal_ctx = current_ephemeral_interaction().ok_or_else(|| {
+                        "send_ephemeral_message is only available while responding to an interaction, such as a modal submission. Use send_message for public channel output.".to_string()
+                    })?;
+
+                if let Some(user_id) = user_id
+                    && user_id != modal_ctx.respondent_user_id
+                {
+                    return Err(format!(
+                        "send_ephemeral_message can only target the current interaction respondent '{}', got '{}'",
+                        modal_ctx.respondent_user_id, user_id
+                    ));
+                }
+
+                let msg = modal_ctx
+                    .interaction
+                    .edit_response(&http, EditInteractionResponse::new().content(content))
+                    .await
+                    .map_err(|e| format!("Failed to edit ephemeral interaction response: {e}"))?;
+
+                let result = json!({
+                    "status": "ok",
+                    "operation": operation,
+                    "visibility": "interaction_ephemeral",
+                    "recipient_user_id": modal_ctx.respondent_user_id.to_string(),
+                    "channel_id": msg.channel_id.to_string(),
+                    "message_id": msg.id.to_string(),
+                    "content_length": msg.content.chars().count(),
+                    "note": "already_sent_ephemeral_interaction_response_do_not_repeat_body_publicly",
                 });
 
                 Ok(result.to_string())
@@ -666,7 +716,7 @@ impl LMTool for DiscordTool {
             other => Err(format!(
                 "Unsupported 'operation': {other}. \
                  Use one of: add_reaction, remove_reaction, create_thread, \
-                 send_message, edit_message, fetch_message, search_messages, \
+                 send_message, send_ephemeral_message, edit_message, fetch_message, search_messages, \
                  list_channels, list_voice_channels, list_voice_members."
             )),
         }

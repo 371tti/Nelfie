@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use anyhow::{Context, Result, anyhow};
 use ratex_layout::{LayoutOptions, layout, to_display_list};
 use ratex_parser::parse;
 use ratex_svg::{SvgOptions, render_to_svg};
@@ -12,10 +11,11 @@ use resvg::{tiny_skia, usvg};
 use serde_json::json;
 use serenity::all::{ChannelId, CreateAttachment, CreateMessage, MessageId};
 
-use crate::{app::context::NelfieContext, llm::client::LMTool};
+use crate::{app::context::NelfieContext, llm::tool::LMTool};
 
 const CJK_FONT_FAMILY: &str = "Noto Serif JP";
 const CJK_FONT_STACK: &str = "Noto Serif JP, sans-serif";
+type RenderResult<T> = Result<T, String>;
 
 static KATEX_FONT_BYTES: &[&[u8]] = &[
     include_bytes!("../../../fonts/KaTeX_font/KaTeX_AMS-Regular.ttf"),
@@ -47,7 +47,7 @@ pub struct LatexExprRenderTool;
 
 impl LatexExprRenderTool {
     pub fn new() -> LatexExprRenderTool {
-        LatexExprRenderTool {}
+        LatexExprRenderTool
     }
 
     fn renderer() -> &'static Ratex2Png {
@@ -59,7 +59,7 @@ impl LatexExprRenderTool {
         })
     }
 
-    pub async fn render(expr: &str, _ob_ctx: &NelfieContext) -> Result<Vec<u8>> {
+    pub fn render(expr: &str) -> RenderResult<Vec<u8>> {
         Self::renderer().render_png_vec(expr)
     }
 }
@@ -124,49 +124,43 @@ impl Ratex2Png {
         self
     }
 
-    pub fn render_svg_string(&self, input: &str) -> Result<String> {
-        let ast = parse(input).map_err(|e| anyhow!("parse error: {e}"))?;
+    pub fn render_svg_string(&self, input: &str) -> RenderResult<String> {
+        let ast = parse(input).map_err(|e| format!("parse error: {e}"))?;
         let layout_box = layout(&ast, &self.layout_options);
         let display_list = to_display_list(&layout_box);
         let svg = render_to_svg(&display_list, &self.svg_options);
         Ok(apply_cjk_font_family(svg))
     }
 
-    pub fn render_png_vec(&self, input: &str) -> Result<Vec<u8>> {
+    pub fn render_png_vec(&self, input: &str) -> RenderResult<Vec<u8>> {
         let svg = self.render_svg_string(input)?;
         self.svg_to_png_vec(&svg)
     }
 
-    pub fn svg_to_png_vec(&self, svg: &str) -> Result<Vec<u8>> {
-        let tree = self.parse_svg(svg)?;
-        let pixmap = self.render_tree_to_pixmap(&tree)?;
-        pixmap.encode_png().context("failed to encode PNG")
-    }
-
-    fn parse_svg(&self, svg: &str) -> Result<usvg::Tree> {
+    pub fn svg_to_png_vec(&self, svg: &str) -> RenderResult<Vec<u8>> {
         let opt = usvg::Options {
             fontdb: self.fontdb.clone(),
             ..Default::default()
         };
-        usvg::Tree::from_str(svg, &opt).context("failed to parse generated SVG with usvg")
-    }
-
-    fn render_tree_to_pixmap(&self, tree: &usvg::Tree) -> Result<tiny_skia::Pixmap> {
+        let tree = usvg::Tree::from_str(svg, &opt)
+            .map_err(|e| format!("failed to parse generated SVG with usvg: {e}"))?;
         let size = tree.size().to_int_size();
 
         let width = (size.width() as f32 * self.scale).ceil() as u32;
         let height = (size.height() as f32 * self.scale).ceil() as u32;
 
         let mut pixmap = tiny_skia::Pixmap::new(width, height)
-            .ok_or_else(|| anyhow!("failed to allocate pixmap"))?;
+            .ok_or_else(|| "failed to allocate pixmap".to_string())?;
 
         pixmap.fill(self.background);
 
         let transform = tiny_skia::Transform::from_scale(self.scale, self.scale);
         let mut pm = pixmap.as_mut();
-        resvg::render(tree, transform, &mut pm);
+        resvg::render(&tree, transform, &mut pm);
 
-        Ok(pixmap)
+        pixmap
+            .encode_png()
+            .map_err(|e| format!("failed to encode PNG: {e}"))
     }
 }
 
@@ -233,7 +227,7 @@ impl LMTool for LatexExprRenderTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        ob_ctx: crate::app::context::NelfieContext,
+        ob_ctx: NelfieContext,
     ) -> Result<String, String> {
         // --- 引数パース ---
         let channel_id_str = args
@@ -264,9 +258,8 @@ impl LMTool for LatexExprRenderTool {
         };
 
         // --- LaTeX → 画像レンダリング ---
-        let png_bytes = Self::render(expr, &ob_ctx)
-            .await
-            .map_err(|e| format!("Failed to render LaTeX expression: {e}"))?;
+        let png_bytes =
+            Self::render(expr).map_err(|e| format!("Failed to render LaTeX expression: {e}"))?;
 
         // --- Discord 送信 ---
         let http = ob_ctx.discord_client.open().http.clone();

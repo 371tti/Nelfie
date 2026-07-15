@@ -1,10 +1,9 @@
-
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use log::info;
+use log::debug;
 use std::collections::HashMap;
 
-use crate::{app::context::NelfieContext, llm::client::LMTool};
+use crate::{app::context::NelfieContext, llm::tool::LMTool};
 
 pub struct GetTime {}
 
@@ -99,7 +98,10 @@ impl GetTime {
         let utc_now: DateTime<Utc> = Utc::now();
         let local_time = utc_now.with_timezone(tz);
 
-        Ok(format!("The current time in {} ({}) is: {}", country_code, tz, local_time))
+        Ok(format!(
+            "The current time in {} ({}) is: {}",
+            country_code, tz, local_time
+        ))
     }
 }
 
@@ -130,9 +132,14 @@ impl LMTool for GetTime {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value, _ob_ctx: NelfieContext) -> Result<String, String> {
-        info!("GetTime::run called with args: {:?}", args);
-        let country_code = args.get("country_code")
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ob_ctx: NelfieContext,
+    ) -> Result<String, String> {
+        debug!("get_time tool called: args={:?}", args);
+        let country_code = args
+            .get("country_code")
             .and_then(|v| v.as_str())
             .ok_or("Missing or invalid 'country_code' parameter".to_string())?;
 
