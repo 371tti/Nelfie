@@ -34,7 +34,7 @@ pub(super) async fn send_long_message(
         return Ok(());
     }
 
-    let total_len = text.chars().count() + 1 + footer.chars().count();
+    let total_len = discord_character_count(text) + 1 + discord_character_count(footer);
     if !footer.is_empty() && total_len <= DISCORD_MESSAGE_LIMIT {
         channel_id
             .send_message(
@@ -88,11 +88,11 @@ pub(super) async fn send_modal_ephemeral_response(
             )
             .await?;
     } else {
-        let total_len = text.chars().count()
+        let total_len = discord_character_count(text)
             + if footer.is_empty() {
                 0
             } else {
-                1 + footer.chars().count()
+                1 + discord_character_count(footer)
             };
 
         if !footer.is_empty() && total_len <= DISCORD_MESSAGE_LIMIT {
@@ -207,39 +207,80 @@ async fn send_code_attachments(
 fn extract_code_blocks(text: &str) -> (String, Vec<CodeAttachment>) {
     let mut out = String::with_capacity(text.len());
     let mut attachments = Vec::new();
-    let mut cursor = 0usize;
+    let mut remaining = text;
     let mut index = 1usize;
 
-    while let Some(rel_start) = text[cursor..].find("```") {
-        let start = cursor + rel_start;
-        out.push_str(&text[cursor..start]);
-
-        let after_ticks = start + 3;
-        let Some(rel_end) = text[after_ticks..].find("```") else {
-            out.push_str(&text[start..]);
-            return (out, attachments);
-        };
-
-        let end = after_ticks + rel_end;
-        let raw = &text[after_ticks..end];
-        let (lang, code) = split_code_block(raw);
-        let code = code.trim_end_matches(['\n', '\r']);
-
-        if !code.trim().is_empty() {
-            let filename = build_code_filename(index, lang);
-            attachments.push(CodeAttachment {
-                filename: filename.clone(),
-                content: code.to_string(),
-            });
-            out.push_str(&format!("[code: {}]", filename));
-            index += 1;
-        }
-
-        cursor = end + 3;
+    while let Some(block) = next_fenced_code_block(remaining) {
+        out.push_str(block.before);
+        append_code_block(
+            block.markdown,
+            block.body,
+            &mut out,
+            &mut attachments,
+            &mut index,
+        );
+        remaining = block.remaining;
     }
 
-    out.push_str(&text[cursor..]);
+    out.push_str(remaining);
     (out, attachments)
+}
+
+struct FencedCodeBlock<'a> {
+    before: &'a str,
+    markdown: &'a str,
+    body: &'a str,
+    remaining: &'a str,
+}
+
+fn next_fenced_code_block(text: &str) -> Option<FencedCodeBlock<'_>> {
+    let start = text.find("```")?;
+    let body_start = start + 3;
+
+    if let Some(relative_end) = text[body_start..].find("```") {
+        let body_end = body_start + relative_end;
+        let block_end = body_end + 3;
+        Some(FencedCodeBlock {
+            before: &text[..start],
+            markdown: &text[start..block_end],
+            body: &text[body_start..body_end],
+            remaining: &text[block_end..],
+        })
+    } else {
+        Some(FencedCodeBlock {
+            before: &text[..start],
+            markdown: &text[start..],
+            body: &text[body_start..],
+            remaining: "",
+        })
+    }
+}
+
+fn append_code_block(
+    block: &str,
+    raw: &str,
+    out: &mut String,
+    attachments: &mut Vec<CodeAttachment>,
+    index: &mut usize,
+) {
+    let (lang, code) = split_code_block(raw);
+    let code = code.trim_end_matches(['\n', '\r']);
+    if code.trim().is_empty() {
+        return;
+    }
+
+    if discord_character_count(block) <= DISCORD_MESSAGE_LIMIT {
+        out.push_str(block);
+        return;
+    }
+
+    let filename = build_code_filename(*index, lang);
+    attachments.push(CodeAttachment {
+        filename: filename.clone(),
+        content: code.to_string(),
+    });
+    out.push_str(&format!("[code: {}]", filename));
+    *index += 1;
 }
 
 fn split_code_block(raw: &str) -> (Option<&str>, &str) {
@@ -286,45 +327,109 @@ fn code_extension_for_language(lang: &str) -> Option<&'static str> {
 }
 
 fn split_message_chunks(text: &str, limit: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-
-    while !rest.is_empty() {
-        let mut count = 0usize;
-        let mut last_break: Option<(usize, usize)> = None;
-        let mut split_at: Option<(usize, usize)> = None;
-
-        for (idx, ch) in rest.char_indices() {
-            count += 1;
-            if ch.is_whitespace() {
-                last_break = Some((idx, ch.len_utf8()));
-            }
-            if count >= limit {
-                split_at = Some((idx, ch.len_utf8()));
-                break;
-            }
-        }
-
-        let Some((idx, len)) = split_at else {
-            let trimmed = rest.trim();
-            if !trimmed.is_empty() {
-                out.push(trimmed.to_string());
-            }
-            break;
-        };
-
-        let (end, next_start) = match last_break {
-            Some((break_idx, break_len)) if break_idx > 0 => (break_idx, break_idx + break_len),
-            _ => (idx + len, idx + len),
-        };
-
-        let head = rest[..end].trim_end();
-        if !head.is_empty() {
-            out.push(head.to_string());
-        }
-
-        rest = rest[next_start..].trim_start_matches(|c: char| c.is_whitespace());
+    if limit == 0 {
+        return Vec::new();
     }
 
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut remaining = text;
+
+    while let Some(block) = next_fenced_code_block(remaining) {
+        append_plain_text(&mut out, &mut current, block.before, limit);
+
+        if !current.is_empty()
+            && discord_character_count(&current)
+                .saturating_add(discord_character_count(block.markdown))
+                > limit
+        {
+            flush_message_chunk(&mut out, &mut current);
+        }
+
+        current.push_str(block.markdown);
+        remaining = block.remaining;
+    }
+
+    append_plain_text(&mut out, &mut current, remaining, limit);
+    flush_message_chunk(&mut out, &mut current);
     out
+}
+
+fn append_plain_text(out: &mut Vec<String>, current: &mut String, segment: &str, limit: usize) {
+    let mut rest = segment;
+
+    while !rest.is_empty() {
+        let current_len = discord_character_count(current);
+        if current_len >= limit {
+            flush_message_chunk(out, current);
+            rest = rest.trim_start_matches(char::is_whitespace);
+            continue;
+        }
+
+        let available = limit - current_len;
+        if discord_character_count(rest) <= available {
+            current.push_str(rest);
+            break;
+        }
+
+        let (end, next_start) = split_plain_text_at_limit(rest, available);
+        if end == 0 {
+            if !current.is_empty() {
+                flush_message_chunk(out, current);
+                continue;
+            }
+
+            let Some(first_char) = rest.chars().next() else {
+                break;
+            };
+            let first_char_len = first_char.len_utf8();
+            current.push_str(&rest[..first_char_len]);
+            rest = &rest[first_char_len..];
+            flush_message_chunk(out, current);
+            continue;
+        }
+
+        current.push_str(&rest[..end]);
+        flush_message_chunk(out, current);
+        rest = rest[next_start..].trim_start_matches(char::is_whitespace);
+    }
+}
+
+fn split_plain_text_at_limit(text: &str, limit: usize) -> (usize, usize) {
+    let mut count = 0usize;
+    let mut hard_end = 0usize;
+    let mut last_break: Option<(usize, usize)> = None;
+
+    for (idx, ch) in text.char_indices() {
+        let char_count = ch.len_utf16();
+        if count.saturating_add(char_count) > limit {
+            break;
+        }
+
+        count += char_count;
+        hard_end = idx + ch.len_utf8();
+        if ch.is_whitespace() {
+            last_break = Some((idx, ch.len_utf8()));
+        }
+        if count == limit {
+            break;
+        }
+    }
+
+    match last_break {
+        Some((break_idx, break_len)) if break_idx > 0 => (break_idx, break_idx + break_len),
+        _ => (hard_end, hard_end),
+    }
+}
+
+fn flush_message_chunk(out: &mut Vec<String>, current: &mut String) {
+    let chunk = current.trim();
+    if !chunk.is_empty() {
+        out.push(chunk.to_string());
+    }
+    current.clear();
+}
+
+fn discord_character_count(text: &str) -> usize {
+    text.encode_utf16().count()
 }
