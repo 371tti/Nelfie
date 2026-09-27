@@ -77,7 +77,7 @@ BASIC:
 
 - `/ping`: Discord API との遅延を測定して返す
 - `/status`: Nelfieのバージョンと実行環境を表示
-- `/tex_expr`: TeX 数式を画像化して送信
+- `/tex <expr>`: TeX 数式を画像化して送信
 
 CHAT BOT:
 
@@ -85,26 +85,29 @@ CHAT BOT:
 - `/disable`: ChatBot 機能を無効化
 - `/clear`: 会話履歴をクリア
 - `/model`: 使用する OpenAI モデルを選択
-- `/rate_config`: レート制限の設定(管理者のみ)
-- `/rate_status [target_user]`: 現在のモデルコスト、一般/cronバケットの `rate_line`、残量、毎時回復量を表示
+- `/rate config <target_user> <limit>`: レート制限の設定(管理者のみ)
+- `/rate status [target_user]`: 現在のモデルコスト、一般/cronバケットの `rate_line`、残量、毎時回復量を表示
 - `/set_system_prompt`: システムプロンプトの設定(管理者のみ)
-- `/cron <cron> <prompt>`: 実行したチャンネルに、cron 表記で定期実行プロンプトを登録
-- `/cron_test [id]`: 登録済み cron を時刻に関係なく即時実行
-- `/del_cron <id>`: 登録済み cron を削除
+- `/cron add <schedule> <prompt>`: 実行したチャンネルに、cron 表記で定期実行プロンプトを登録
+- `/cron test [id]`: 登録済み cron を時刻に関係なく即時実行。IDを省略できるのは、このチャンネルに登録が1件だけの場合です。
+- `/cron delete <id>`: 登録済み cron を削除
 
 VC / TTS:
 
-- `/vc_join [auto_read]`: ボイスチャンネルに参加します。オプションで自動読み上げを有効化できます。
-- `/vc_leave`: ボイスチャンネルから退出します。
-- `/vc_say <text>`: 指定したテキストを読み上げます。
-- `/vc_download <text>`: 現在の設定でWAV音声を生成し、ダウンロード可能なファイルとして送信します。
-- `/vc_autoread <enabled>`: 自動読み上げの有効/無効を切り替えます。
-- `/vc_dict <source> <target>`: 読み上げの辞書エントリを追加/削除します。
-- `/vc_speaker ...`: 話者, スタイル, 音程, 速さ, パンの設定を行います。
-- `/vc_status`: 現在の VC 状態と VOICEVOX 設定を表示します。
-- `/vc_config ...`: 読み上げの詳細設定を行います。(自動読み上げ, システム読み上げ, 並列読み上げ)
+- `/vc join [auto_read]`: ボイスチャンネルに参加します。オプションでこのテキストチャンネルの自動読み上げを有効化できます。
+- `/vc leave`: ボイスチャンネルから退出します。
+- `/vc say <text>`: 指定したテキストを読み上げます。
+- `/vc download <text>`: 現在の話者設定でWAV音声を生成し、ダウンロード可能なファイルとして送信します。
+- `/vc config [system_read] [auto_read] [parallel_count]`: システム読み上げ、自動読み上げ、並列数を更新します。省略した項目は現在の設定を維持します。
+- `/vc autoread <enabled>`: このテキストチャンネルでの自動読み上げの有効/無効を切り替えます。
+- `/vc dict <source> <target>`: このテキストチャンネルの読み上げ辞書を登録または更新します。
+- `/vc dict-delete <source>`: このテキストチャンネルの読み上げ辞書エントリを削除します。
+- `/vc dict-user <source> <target>`: 自分用の読み上げ辞書を登録または更新します。
+- `/vc dict-user-delete <source>`: 自分用の読み上げ辞書エントリを削除します。
+- `/vc speaker <speaker> <style> [speed] [pitch] [pan]`: 自分の話者、スタイル、話速、音高、左右パンを設定します。
+- `/vc status`: 現在の VC 状態と VOICEVOX 設定を表示します。
 
-cron は実行環境のローカル時刻で、標準的な 5 フィールド表記（例: `*/30 * * * *`）を使います。prefix command では cron 表記を `"*/30 * * * *"` のように引用してください。AI も `cron-tool` で cron の作成・一覧・削除を行えます。cron 実行は通常応答とは別の guild 単位 cron バケットで制御され、標準設定では 1 guild あたりおおむね 1 時間に 1 回実行できます。通常の `/rate_config` は一般応答用のレート制限だけを変更します。
+cron は実行環境のローカル時刻で、標準的な 5 フィールド表記（例: `*/30 * * * *`）を使います。prefix command では `cron add "*/30 * * * *" <prompt>` のように cron 表記を引用してください。AI も `cron-tool` で cron の作成・一覧・削除を行えます。cron 実行は通常応答とは別の guild 単位 cron バケットで制御され、標準設定では 1 guild あたりおおむね 1 時間に 1 回実行できます。通常の `/rate config` は一般応答用のレート制限だけを変更します。
 
 利用可能なモデルには `gpt-5.6-luna`（cost x3）、`gpt-5.6-terra`（cost x6）、`gpt-5.6-sol`（cost x9）を含みます。モデル一覧と現在モデルでは、レート制限で消費するコストを `xN` 形式で表示します。ユーザー既定、システム、cron、context要約のモデルは `Models` の `USER_DEFAULT_MODEL`、`SYSTEM_MODEL`、`CRON_MODEL`、`CONTEXT_SUMMARY_MODEL` で用途別に定義します。現在はいずれも `gpt-5.6-luna` です。
 

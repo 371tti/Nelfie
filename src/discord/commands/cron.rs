@@ -3,9 +3,19 @@ use serenity::all::{AutocompleteChoice, CreateEmbed};
 
 use super::shared::{Context, Error, preview_text};
 
+/// Manage scheduled prompts in this server.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    subcommands("cron_add", "cron_test", "del_cron")
+)]
+pub async fn cron(_: Context<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
 /// Register a scheduled LLM prompt in this channel.
-#[poise::command(slash_command, prefix_command)]
-pub async fn cron(
+#[poise::command(slash_command, prefix_command, rename = "add")]
+pub async fn cron_add(
     ctx: Context<'_>,
     #[description = "Cron expression, for example: */30 * * * *"] schedule: String,
     #[description = "Prompt to send automatically"]
@@ -13,7 +23,7 @@ pub async fn cron(
     prompt: String,
 ) -> Result<(), Error> {
     let Some(guild_id) = ctx.guild_id() else {
-        ctx.say("エラー: cron はサーバーチャンネル内でのみ登録できます。")
+        ctx.say("エラー: /cron add はサーバーチャンネル内でのみ登録できます。")
             .await?;
         return Ok(());
     };
@@ -52,7 +62,7 @@ pub async fn cron(
 }
 
 /// Run an already registered cron job immediately.
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "test")]
 pub async fn cron_test(
     ctx: Context<'_>,
     #[description = "Cron ID. If omitted, runs the only cron registered in this channel."]
@@ -60,7 +70,7 @@ pub async fn cron_test(
     id: Option<String>,
 ) -> Result<(), Error> {
     let Some(guild_id) = ctx.guild_id() else {
-        ctx.say("エラー: cron_test はサーバーチャンネル内でのみ使用できます。")
+        ctx.say("エラー: /cron test はサーバーチャンネル内でのみ使用できます。")
             .await?;
         return Ok(());
     };
@@ -125,7 +135,7 @@ pub async fn cron_test(
     );
 
     ctx.say(format!(
-        "info: cron_test を実行キューに入れました: `{}`",
+        "info: /cron test を実行キューに入れました: `{}`",
         job.id
     ))
     .await?;
@@ -133,7 +143,7 @@ pub async fn cron_test(
 }
 
 /// Delete a registered cron job.
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "delete")]
 pub async fn del_cron(
     ctx: Context<'_>,
     #[description = "Cron ID to delete"]
@@ -141,7 +151,7 @@ pub async fn del_cron(
     id: String,
 ) -> Result<(), Error> {
     let Some(guild_id) = ctx.guild_id() else {
-        ctx.say("エラー: del_cron はサーバーチャンネル内でのみ使用できます。")
+        ctx.say("エラー: /cron delete はサーバーチャンネル内でのみ使用できます。")
             .await?;
         return Ok(());
     };

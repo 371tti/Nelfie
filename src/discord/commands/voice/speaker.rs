@@ -14,7 +14,7 @@ use super::support::{
 };
 
 /// VOICEVOXの話者とスタイルを設定します（ユーザーごと）
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "speaker")]
 pub async fn vc_speaker(
     ctx: Context<'_>,
     #[description = "VOICEVOX話者名"]
@@ -27,7 +27,7 @@ pub async fn vc_speaker(
     #[description = "音高 (-1.0〜1.0, 省略時は現状維持)"] pitch: Option<f32>,
     #[description = "左右pan (-1.0=左, 0.0=中央, 1.0=右, 省略時は現状維持)"] pan: Option<f32>,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_speaker").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc speaker").await? else {
         return Ok(());
     };
 
@@ -175,9 +175,9 @@ async fn autocomplete_vc_style(ctx: Context<'_>, partial: &str) -> Vec<Autocompl
 }
 
 /// VOICEVOXの話者設定と状態を取得します（ユーザーごと）
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "status")]
 pub async fn vc_status(ctx: Context<'_>) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_status").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc status").await? else {
         return Ok(());
     };
 

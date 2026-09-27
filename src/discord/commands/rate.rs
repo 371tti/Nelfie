@@ -5,8 +5,18 @@ use crate::llm::user::UserContextScope;
 
 use super::shared::{Context, Error};
 
+/// Configure and inspect rate limits.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    subcommands("rate_config", "rate_status")
+)]
+pub async fn rate(_: Context<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
 /// only admin user
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "config")]
 pub async fn rate_config(
     ctx: Context<'_>,
 
@@ -20,7 +30,7 @@ pub async fn rate_config(
 
     let caller_id_u64 = ctx.author().id.get();
     if !ob_ctx.config.admin_users.contains(&caller_id_u64) {
-        ctx.say("エラー: /rate_config を実行する権限がありません。")
+        ctx.say("エラー: /rate config を実行する権限がありません。")
             .await?;
         return Ok(());
     }
@@ -89,7 +99,7 @@ pub async fn rate_config(
     Ok(())
 }
 
-/// `/rate_config` の第2引数 `limit` 用のオートコンプリート
+/// `/rate config` の第2引数 `limit` 用のオートコンプリート
 async fn autocomplete_rate_limit(_ctx: Context<'_>, partial: &str) -> Vec<String> {
     let base_candidates = [
         "unlimit", "reset", "1", "2", "3", "5", "10", "30", "60", "120", "300", "600", "1800",
@@ -175,7 +185,7 @@ fn format_multiplier(value: f64) -> String {
 }
 
 /// Show the current general and cron rate-limit buckets.
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "status")]
 pub async fn rate_status(
     ctx: Context<'_>,
     #[description = "Target user (default: yourself)"] target_user: Option<User>,

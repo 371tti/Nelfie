@@ -201,7 +201,7 @@ async fn autocomplete_model_name(_ctx: Context<'_>, partial: &str) -> Vec<String
 }
 
 /// latex expr render
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "tex")]
 pub async fn tex_expr(
     ctx: Context<'_>,
     #[description = "LaTeX expression to render"]

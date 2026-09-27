@@ -50,13 +50,13 @@ fn build_vc_dictionary_embed(
 }
 
 /// このテキストチャンネルの読み上げ辞書を登録/更新します
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "dict")]
 pub async fn vc_dict(
     ctx: Context<'_>,
     #[description = "変換前の語句"] source: String,
     #[description = "読み上げ時の置換語句"] target: String,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_dict").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc dict").await? else {
         return Ok(());
     };
 
@@ -96,14 +96,14 @@ pub async fn vc_dict(
 }
 
 /// このテキストチャンネルの読み上げ辞書エントリを削除します
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "dict-delete")]
 pub async fn vc_dict_delete(
     ctx: Context<'_>,
     #[description = "削除する変換前の語句"]
     #[autocomplete = "autocomplete_vc_dict_source"]
     source: String,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_dict_delete").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc dict-delete").await? else {
         return Ok(());
     };
 
@@ -149,13 +149,13 @@ pub async fn vc_dict_delete(
 }
 
 /// ユーザーごとの読み上げ辞書を登録/更新します
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "dict-user")]
 pub async fn vc_dict_user(
     ctx: Context<'_>,
     #[description = "変換前の語句"] source: String,
     #[description = "読み上げ時の置換語句"] target: String,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_dict_user").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc dict-user").await? else {
         return Ok(());
     };
 
@@ -195,14 +195,14 @@ pub async fn vc_dict_user(
 }
 
 /// ユーザーごとの読み上げ辞書エントリを削除します
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "dict-user-delete")]
 pub async fn vc_dict_user_delete(
     ctx: Context<'_>,
     #[description = "削除する変換前の語句"]
     #[autocomplete = "autocomplete_vc_dict_user_source"]
     source: String,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_dict_user_delete").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc dict-user-delete").await? else {
         return Ok(());
     };
 

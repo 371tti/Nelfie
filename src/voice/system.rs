@@ -293,7 +293,7 @@ impl VoiceSystem {
         }
 
         if self.current_voice_channel_raw(guild_id).await.is_none() {
-            let err = "Not connected to a voice channel. Run /vc_join first.".to_string();
+            let err = "Not connected to a voice channel. Run /vc join first.".to_string();
             self.set_last_error(guild_id, err.clone());
             return Err(err);
         }

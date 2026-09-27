@@ -14,14 +14,14 @@ use super::support::{
 };
 
 /// VCに接続します(VC関連の機能が有効になります)
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "join")]
 pub async fn vc_join(
     ctx: Context<'_>,
     #[description = "Enable auto-read in this text channel (default: true)"] auto_read: Option<
         bool,
     >,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_join").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc join").await? else {
         return Ok(());
     };
 
@@ -78,9 +78,9 @@ pub async fn vc_join(
 }
 
 /// VCから切断します(VC関連の機能が無効になります)
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "leave")]
 pub async fn vc_leave(ctx: Context<'_>) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_leave").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc leave").await? else {
         return Ok(());
     };
 
@@ -109,14 +109,14 @@ pub async fn vc_leave(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// テキストをVCで読み上げます
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "say")]
 pub async fn vc_say(
     ctx: Context<'_>,
     #[description = "Text to read in VC"]
     #[rest]
     text: String,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_say").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc say").await? else {
         return Ok(());
     };
 
@@ -167,14 +167,14 @@ pub async fn vc_say(
 }
 
 /// 現在の話者設定で音声ファイル（WAV）を生成して送信します
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "download")]
 pub async fn vc_download(
     ctx: Context<'_>,
     #[description = "Text to synthesize and download as WAV"]
     #[rest]
     text: String,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_download").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc download").await? else {
         return Ok(());
     };
 
@@ -233,7 +233,7 @@ pub async fn vc_download(
 }
 
 /// VC関連設定（システム読み上げ / 自動読み上げ / 並列数）を更新します
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "config")]
 pub async fn vc_config(
     ctx: Context<'_>,
     #[description = "Enable system read for VC command and join/leave announcements (None: keep current)"]
@@ -243,7 +243,7 @@ pub async fn vc_config(
     #[description = "Read parallel count for this text channel (1..4, None: keep current)"]
     parallel_count: Option<u8>,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_config").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc config").await? else {
         return Ok(());
     };
 
@@ -341,12 +341,12 @@ pub async fn vc_config(
 }
 
 /// このテキストチャンネルでの自動読み上げを有効/無効にします
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, rename = "autoread")]
 pub async fn vc_autoread(
     ctx: Context<'_>,
     #[description = "Enable auto-read for this text channel"] enabled: bool,
 ) -> Result<(), Error> {
-    let Some(guild_id) = require_vc_guild(&ctx, "vc_autoread").await? else {
+    let Some(guild_id) = require_vc_guild(&ctx, "/vc autoread").await? else {
         return Ok(());
     };
 
