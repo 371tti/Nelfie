@@ -76,6 +76,7 @@ v0.1.4以降はserenityの起動とdownloaderの起動が直列化しました�
 BASIC:
 
 - `/ping`: Discord API との遅延を測定して返す
+- `/status`: Nelfieのバージョンと実行環境を表示
 - `/tex_expr`: TeX 数式を画像化して送信
 
 CHAT BOT:

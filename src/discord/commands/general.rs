@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use log::{error, info};
 use poise::CreateReply;
-use serenity::all::CreateAttachment;
+use serenity::all::{CreateAttachment, CreateEmbed};
 
 use crate::llm::{models::Models, tools::latex::LatexExprRenderTool};
 
@@ -25,6 +25,21 @@ pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
     )
     .await?;
 
+    Ok(())
+}
+
+/// Show Nelfie's version and runtime information.
+#[poise::command(slash_command, prefix_command)]
+pub async fn status(ctx: Context<'_>) -> Result<(), Error> {
+    let bot_user_id = ctx.serenity_context().cache.current_user().id;
+    let runtime = format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH);
+    let embed = CreateEmbed::new()
+        .title("Nelfie Status")
+        .field("Version", format!("v{}", env!("CARGO_PKG_VERSION")), true)
+        .field("Runtime", runtime, true)
+        .field("Bot User ID", bot_user_id.to_string(), true);
+
+    ctx.send(CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 

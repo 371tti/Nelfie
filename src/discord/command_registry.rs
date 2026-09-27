@@ -5,6 +5,7 @@ pub type CommandError = Box<dyn std::error::Error + Send + Sync>;
 pub fn all() -> Vec<poise::Command<NelfieContext, CommandError>> {
     vec![
         commands::ping(),
+        commands::status(),
         commands::enable(),
         commands::clear(),
         commands::disable(),
