@@ -91,7 +91,7 @@ impl NelfieContext {
         self.active_responses.clear();
         self.responding_channels.clear();
         self.cron_scheduler.stop();
-        self.voice_system.clear_all();
+        self.voice_system.clear_all().await;
 
         self.response_seq.store(1, Ordering::Relaxed);
         info!("Shutting down NelfieContext...");

@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use log::warn;
 use serenity::all::{
     ActionRowComponent, CreateInteractionResponse, CreateInteractionResponseMessage, Interaction,
 };
@@ -18,6 +19,35 @@ pub(super) async fn handle_interaction(
     match interaction {
         Interaction::Component(component) => {
             let trigger_id = component.data.custom_id.clone();
+            if let Some(music_action) =
+                trigger_id.strip_prefix(crate::voice::music::MUSIC_COMPONENT_PREFIX)
+            {
+                let Some((guild_raw, action)) = music_action.split_once(':') else {
+                    component
+                        .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                        .await?;
+                    return Ok(());
+                };
+                let parsed_guild = guild_raw
+                    .parse::<u64>()
+                    .ok()
+                    .map(serenity::all::GuildId::new);
+                let guild_id = parsed_guild.filter(|guild| Some(*guild) == component.guild_id);
+                component
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await?;
+                if let Some(guild_id) = guild_id {
+                    if let Err(error) = ob_context
+                        .voice_system
+                        .music
+                        .handle_component(guild_id, component.message.id, action)
+                        .await
+                    {
+                        warn!("music control interaction failed: {error}");
+                    }
+                }
+                return Ok(());
+            }
             let decoded_modal =
                 crate::llm::tools::modal_builder::decode_modal_trigger_custom_id(&trigger_id);
             let Some((modal_spec, submit_custom_id)) = (match decoded_modal {

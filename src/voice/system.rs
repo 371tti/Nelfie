@@ -18,6 +18,7 @@ use tokio::{
 
 use super::{
     core_runtime::CoreRuntime,
+    music::MusicSystem,
     text::{normalize_tts_text, normalize_tts_text_full, split_tts_segments},
     types::{GuildVoiceConfig, SpeakOptions, SpeakRequest, VoiceCoreConfig},
 };
@@ -39,6 +40,7 @@ fn normalize_parallel_count(parallel_count: usize) -> usize {
 
 #[derive(Clone)]
 pub struct VoiceSystem {
+    pub music: MusicSystem,
     default_speaker: u32,
     core_config: VoiceCoreConfig,
     core_runtime: Arc<OnceCell<Arc<CoreRuntime>>>,
@@ -54,6 +56,7 @@ pub struct VoiceSystem {
 impl VoiceSystem {
     pub fn new(default_speaker: u32, core_config: VoiceCoreConfig) -> Self {
         Self {
+            music: MusicSystem::new(),
             default_speaker,
             core_config,
             core_runtime: Arc::new(OnceCell::new()),
@@ -101,12 +104,14 @@ impl VoiceSystem {
     }
 
     pub fn set_songbird(&self, manager: Arc<Songbird>) {
+        self.music.set_songbird(manager.clone());
         if let Ok(mut w) = self.songbird.write() {
             *w = Some(manager);
         }
     }
 
-    pub fn clear_all(&self) {
+    pub async fn clear_all(&self) {
+        self.music.clear_all().await;
         self.channel_queues.clear();
         self.channel_parallel_counts.clear();
         self.channel_parallel_semaphores.clear();
@@ -246,6 +251,8 @@ impl VoiceSystem {
         let manager = self
             .songbird_manager()
             .ok_or_else(|| "Voice manager is not initialized".to_string())?;
+
+        self.music.clear_guild(guild_id).await;
 
         manager
             .remove(guild_id)

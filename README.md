@@ -96,6 +96,10 @@ VC / TTS:
 
 - `/vc join [auto_read]`: ボイスチャンネルに参加します。オプションでこのテキストチャンネルの自動読み上げを有効化できます。
 - `/vc leave`: ボイスチャンネルから退出します。
+- `/vc play url <url>`: YouTube / YouTube Music の曲またはプレイリストをキューへ追加します。プレイリストは1回の操作につき最大100曲まで追加し、再生開始時にコントロールパネルを表示します。
+- `/vc play open` / `/vc play close`: コントロールパネルを表示 / 閉じます。曲が切り替わるとパネルを最新メッセージとして作り直します。
+- `/vc play queue`, `/vc play pop <曲>`, `/vc play push_front <url>`, `/vc play push_back <url>`, `/vc play del <曲>`, `/vc play clear`, `/vc play shuffle`: 待機キューを確認、並べ替え、削除します。曲を選ぶ引数はキュー内の曲名から補完できます。
+- `/vc play previous`, `/vc play next`, `/vc play toggle`, `/vc play stop`, `/vc play volume <0〜100>`: 再生操作と音量調節を行います。パネルのボタンからも再生、一時停止、前後移動、停止、音量変更ができます。
 - `/vc say <text>`: 指定したテキストを読み上げます。
 - `/vc download <text>`: 現在の話者設定でWAV音声を生成し、ダウンロード可能なファイルとして送信します。
 - `/vc config [system_read] [auto_read] [parallel_count]`: システム読み上げ、自動読み上げ、並列数を更新します。省略した項目は現在の設定を維持します。
@@ -106,6 +110,8 @@ VC / TTS:
 - `/vc dict-user-delete <source>`: 自分用の読み上げ辞書エントリを削除します。
 - `/vc speaker <speaker> <style> [speed] [pitch] [pan]`: 自分の話者、スタイル、話速、音高、左右パンを設定します。
 - `/vc status`: 現在の VC 状態と VOICEVOX 設定を表示します。
+
+音楽再生の初回利用時は、YouTube URLの解析に使う `yt-dlp` とJavaScriptランタイムの `Deno` を公式リリースから取得し、実行ファイルと同じディレクトリの `runtime/music` に保存します。曲の音声はファイルに保存せず、ストリームで再生します。音楽再生の初回利用時に公式リリースの更新を確認し、以降はプロセス内のキャッシュを使います。初回利用時にGitHubへ接続できる必要があります。
 
 cron は実行環境のローカル時刻で、標準的な 5 フィールド表記（例: `*/30 * * * *`）を使います。prefix command では `cron add "*/30 * * * *" <prompt>` のように cron 表記を引用してください。AI も `cron-tool` で cron の作成・一覧・削除を行えます。cron 実行は通常応答とは別の guild 単位 cron バケットで制御され、標準設定では 1 guild あたりおおむね 1 時間に 1 回実行できます。通常の `/rate config` は一般応答用のレート制限だけを変更します。
 
