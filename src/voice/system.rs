@@ -264,6 +264,17 @@ impl VoiceSystem {
         handler.current_channel().map(|cid| cid.0.get())
     }
 
+    pub fn connected_voice_guild_ids(&self) -> Vec<GuildId> {
+        self.songbird_manager()
+            .map(|manager| {
+                manager
+                    .iter()
+                    .map(|(guild_id, _)| GuildId::new(guild_id.0.get()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn speak(
         &self,
         guild_id: GuildId,

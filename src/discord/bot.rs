@@ -6,7 +6,10 @@ use songbird::SerenityInit;
 
 use crate::{
     app::context::NelfieContext,
-    discord::{client::DiscordClientHandles, command_registry, events::event_handler},
+    discord::{
+        client::DiscordClientHandles, command_registry, events::event_handler,
+        voice_events::start_auto_leave_monitor,
+    },
 };
 
 pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -35,6 +38,7 @@ pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + S
 
                 if let Some(songbird_manager) = songbird::get(ctx).await {
                     ob_ctx.voice_system.set_songbird(songbird_manager);
+                    start_auto_leave_monitor(ctx.clone(), ob_ctx.clone());
                 }
                 ob_ctx.cron_scheduler.start(ctx.clone(), ob_ctx.clone());
 

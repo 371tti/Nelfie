@@ -2,11 +2,45 @@ use std::error::Error;
 
 use log::{info, warn};
 use serenity::all::{ChannelId, CreateMessage, GuildId, VoiceState};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 
 use crate::{
     app::context::NelfieContext,
     voice::{SpeakOptions, apply_tts_dictionaries},
 };
+
+const AUTO_LEAVE_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+const AUTO_LEAVE_EVENT_DELAY: Duration = Duration::from_secs(1);
+const AUTO_LEAVE_RECHECK_DELAY: Duration = Duration::from_secs(1);
+
+pub(crate) fn start_auto_leave_monitor(ctx: serenity::client::Context, ob_context: NelfieContext) {
+    tokio::spawn(async move {
+        let mut sweep = interval(AUTO_LEAVE_SWEEP_INTERVAL);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        sweep.tick().await;
+
+        loop {
+            sweep.tick().await;
+            let checks = ob_context
+                .voice_system
+                .connected_voice_guild_ids()
+                .into_iter()
+                .map(|guild_id| {
+                    let ctx = ctx.clone();
+                    let ob_context = ob_context.clone();
+                    tokio::spawn(async move {
+                        leave_if_voice_channel_is_empty(&ctx, &ob_context, guild_id, None).await;
+                    })
+                })
+                .collect::<Vec<_>>();
+            for check in checks {
+                if let Err(error) = check.await {
+                    warn!("empty voice channel monitor task failed: {}", error);
+                }
+            }
+        }
+    });
+}
 
 pub(super) async fn handle_voice_state_update(
     ctx: &serenity::client::Context,
@@ -59,39 +93,23 @@ pub(super) async fn handle_voice_state_update(
         return Ok(());
     }
 
-    if left_bot_channel && is_bot_voice_channel_empty(ctx, guild_id, bot_voice_channel) {
-        if let Err(e) = ob_context.voice_system.leave_voice(guild_id).await {
-            warn!("failed to auto-leave empty voice channel: {}", e);
+    if left_bot_channel {
+        let task_ctx = ctx.clone();
+        let task_context = ob_context.clone();
+        tokio::spawn(async move {
+            sleep(AUTO_LEAVE_EVENT_DELAY).await;
+            leave_if_voice_channel_is_empty(
+                &task_ctx,
+                &task_context,
+                guild_id,
+                Some(bot_voice_channel),
+            )
+            .await;
+        });
+
+        if is_bot_voice_channel_empty(ctx, guild_id, bot_voice_channel) {
             return Ok(());
         }
-
-        if let Some(text_channel) = ob_context.voice_system.config(guild_id).text_channel_id {
-            ob_context
-                .chat_contexts
-                .set_voice_auto_read(text_channel, false);
-            ob_context
-                .voice_system
-                .set_auto_read(guild_id, false, Some(text_channel));
-
-            if let Err(e) = text_channel
-                .send_message(
-                    &ctx.http,
-                    CreateMessage::new().content(
-                        "ボイスチャンネルに誰もいなくなったため、自動でVCから切断しました。",
-                    ),
-                )
-                .await
-            {
-                warn!("failed to send auto-leave message to text channel: {}", e);
-            }
-        }
-
-        info!(
-            "Auto-left guild {} voice channel {} because no other users remained",
-            guild_id.get(),
-            bot_voice_channel.get()
-        );
-        return Ok(());
     }
 
     let Some(text_channel) = ob_context.voice_system.config(guild_id).text_channel_id else {
@@ -151,6 +169,72 @@ pub(super) async fn handle_voice_state_update(
     }
 
     Ok(())
+}
+
+async fn leave_if_voice_channel_is_empty(
+    ctx: &serenity::client::Context,
+    ob_context: &NelfieContext,
+    guild_id: GuildId,
+    expected_channel: Option<ChannelId>,
+) {
+    let Some(channel_raw) = ob_context
+        .voice_system
+        .current_voice_channel_raw(guild_id)
+        .await
+    else {
+        return;
+    };
+    let channel_id = ChannelId::new(channel_raw);
+    if expected_channel.is_some_and(|expected| expected != channel_id)
+        || !is_bot_voice_channel_empty(ctx, guild_id, channel_id)
+    {
+        return;
+    }
+
+    sleep(AUTO_LEAVE_RECHECK_DELAY).await;
+    if ob_context
+        .voice_system
+        .current_voice_channel_raw(guild_id)
+        .await
+        != Some(channel_raw)
+        || !is_bot_voice_channel_empty(ctx, guild_id, channel_id)
+    {
+        return;
+    }
+
+    if let Err(error) = ob_context.voice_system.leave_voice(guild_id).await {
+        warn!("failed to auto-leave empty voice channel: {}", error);
+        return;
+    }
+
+    if let Some(text_channel) = ob_context.voice_system.config(guild_id).text_channel_id {
+        ob_context
+            .chat_contexts
+            .set_voice_auto_read(text_channel, false);
+        ob_context
+            .voice_system
+            .set_auto_read(guild_id, false, Some(text_channel));
+
+        if let Err(error) = text_channel
+            .send_message(
+                &ctx.http,
+                CreateMessage::new()
+                    .content("ボイスチャンネルに誰もいなくなったため、自動でVCから切断しました。"),
+            )
+            .await
+        {
+            warn!(
+                "failed to send auto-leave message to text channel: {}",
+                error
+            );
+        }
+    }
+
+    info!(
+        "Auto-left guild {} voice channel {} because no other users remained",
+        guild_id.get(),
+        channel_id.get()
+    );
 }
 
 fn is_bot_voice_channel_empty(
