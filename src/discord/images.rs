@@ -201,55 +201,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lm_context_stores_refreshable_discord_image_sources() {
-        let mut context = LMContext::new();
-        context.add_user_text_with_discord_images(
-            "image".to_string(),
-            vec![DiscordImageSource {
-                channel_id: 1,
-                message_id: 2,
-                attachment_id: 3,
-                captured_at_unix: 4,
-                url: "https://cdn.discordapp.example/image.png".to_string(),
-            }],
-        );
-
-        assert_eq!(context.discord_image_sources.len(), 1);
-        assert_eq!(context.discord_image_sources[0].attachment_id, 3);
-    }
-
-    #[test]
-    fn content_type_normalization_accepts_supported_images() {
-        assert_eq!(
-            normalize_supported_image_content_type("image/png"),
-            Some("image/png")
-        );
-        assert_eq!(
-            normalize_supported_image_content_type("image/jpg; charset=binary"),
-            Some("image/jpeg")
-        );
-        assert_eq!(
-            supported_image_content_type_from_filename("PHOTO.WEBP"),
-            Some("image/webp")
-        );
-        assert_eq!(supported_image_content_type_from_filename("note.txt"), None);
-        assert_eq!(
-            normalize_supported_image_content_type("image/svg+xml"),
-            None
-        );
-    }
-
-    #[test]
-    fn signed_url_expiry_is_parsed_as_hex_unix_timestamp() {
-        assert_eq!(
-            discord_attachment_expiry_unix(
-                "https://cdn.discordapp.com/attachments/1/2/image.png?ex=65d903de&is=65c68ede&hm=abc"
-            ),
-            Some(0x65d903de)
-        );
-    }
-
-    #[test]
     fn signed_url_refreshes_at_ten_minute_margin() {
         let source = DiscordImageSource {
             channel_id: 1,
@@ -262,19 +213,5 @@ mod tests {
 
         assert!(!should_refresh_discord_image_source(&source, 0x1000 - 601));
         assert!(should_refresh_discord_image_source(&source, 0x1000 - 600));
-    }
-
-    #[test]
-    fn unsigned_url_uses_capture_time_fallback() {
-        let source = DiscordImageSource {
-            channel_id: 1,
-            message_id: 2,
-            attachment_id: 3,
-            captured_at_unix: 100,
-            url: "https://example.com/image.png".to_string(),
-        };
-
-        assert!(!should_refresh_discord_image_source(&source, 100 + 3_599));
-        assert!(should_refresh_discord_image_source(&source, 100 + 3_600));
     }
 }

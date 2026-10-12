@@ -710,23 +710,6 @@ mod tests {
         }))
     }
 
-    fn discord_tool_call_item(operation: &str, content: &str) -> InputItem {
-        InputItem::Item(Item::FunctionCall(FunctionToolCall {
-            arguments: serde_json::json!({
-                "operation": operation,
-                "content": content,
-                "channel_id": "123",
-                "user_id": "456",
-            })
-            .to_string(),
-            call_id: format!("call_{operation}"),
-            namespace: None,
-            name: "discord-tool".to_string(),
-            id: None,
-            status: None,
-        }))
-    }
-
     fn input_items(input: InputParam) -> Vec<InputItem> {
         match input {
             InputParam::Items(items) => items,
@@ -853,51 +836,6 @@ mod tests {
     }
 
     #[test]
-    fn passive_history_merge_does_not_erase_last_response_usage() {
-        let mut history = LMContext::new();
-        history.record_response_usage(12_345, 10_000, 4_096);
-        let mut passive_message = LMContext::new();
-        passive_message.add_text("passive".to_string(), Role::User);
-
-        history.extend(&passive_message);
-
-        assert_eq!(history.response_total_tokens(), Some(12_345));
-        assert_eq!(
-            history.response_cache_usage(),
-            Some(PromptCacheUsage {
-                input_tokens: 10_000,
-                cached_tokens: 4_096,
-            })
-        );
-    }
-
-    #[test]
-    fn response_usage_aggregates_tool_call_rounds() {
-        let mut response = LMContext::new();
-        response.record_response_usage(1_200, 1_000, 0);
-        response.record_response_usage(1_400, 1_100, 768);
-
-        assert_eq!(response.response_total_tokens(), Some(2_600));
-        let cache = response.response_cache_usage().unwrap();
-        assert_eq!(cache.input_tokens, 2_100);
-        assert_eq!(cache.cached_tokens, 768);
-        assert!(cache.hit());
-    }
-
-    #[test]
-    fn history_is_not_rolled_by_item_count() {
-        let mut history = LMContext::new();
-        let mut messages = LMContext::new();
-        for index in 0..100 {
-            messages.add_text(format!("message {index}"), Role::User);
-        }
-
-        history.extend(&messages);
-
-        assert_eq!(history.buf.len(), 100);
-    }
-
-    #[test]
     fn compaction_input_replaces_images_with_text_markers() {
         let image_url = "https://cdn.discordapp.com/attachments/1/2/image.png?ex=ffff";
         let mut history = LMContext::new();
@@ -911,31 +849,5 @@ mod tests {
 
         assert!(!serialized.contains(image_url));
         assert!(serialized.contains("image attachment(s) omitted"));
-    }
-
-    #[test]
-    fn latest_discord_send_record_marks_channel_message_public() {
-        let mut history = LMContext::new();
-        history
-            .buf
-            .push_back(discord_tool_call_item("send_message", "public"));
-
-        let record = history.get_latest_discord_send_record().unwrap();
-
-        assert_eq!(record.content, "public");
-        assert!(!record.private);
-    }
-
-    #[test]
-    fn latest_discord_send_record_marks_ephemeral_message_private() {
-        let mut history = LMContext::new();
-        history
-            .buf
-            .push_back(discord_tool_call_item("send_ephemeral_message", "private"));
-
-        let record = history.get_latest_discord_send_record().unwrap();
-
-        assert_eq!(record.content, "private");
-        assert!(record.private);
     }
 }

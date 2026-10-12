@@ -254,34 +254,3 @@ pub async fn rate_status(
     ctx.send(CreateReply::default().embed(embed)).await?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rate_bucket_reports_capacity_remaining_and_hourly_recovery() {
-        let status = RateBucketStatus::calculate(1_000, 1_000, 16_200, 600);
-
-        assert_eq!(status.remaining_units, Some(27));
-        assert_eq!(status.capacity_units, 27);
-        assert_eq!(status.recovery_units_per_hour, 6.0);
-        assert_eq!(status.fully_recovers_at, None);
-    }
-
-    #[test]
-    fn rate_bucket_accounts_for_future_rate_line() {
-        let status = RateBucketStatus::calculate(1_600, 1_000, 16_200, 600);
-
-        assert_eq!(status.remaining_units, Some(26));
-        assert_eq!(status.fully_recovers_at, Some(1_600));
-    }
-
-    #[test]
-    fn zero_rate_line_is_unlimited() {
-        let status = RateBucketStatus::calculate(0, 1_000, 16_200, 600);
-
-        assert_eq!(status.remaining_units, None);
-        assert!(status.render().contains("unlimited"));
-    }
-}

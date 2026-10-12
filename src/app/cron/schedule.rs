@@ -239,7 +239,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_accepts_five_fields_and_leading_zero_seconds() {
+    fn parser_handles_cron_extensions_and_rejects_seconds() {
         assert_eq!(
             normalize_cron_expression("*/30 * * * *").unwrap(),
             "*/30 * * * *"
@@ -248,15 +248,7 @@ mod tests {
             normalize_cron_expression("0 */10 * * * *").unwrap(),
             "*/10 * * * *"
         );
-    }
-
-    #[test]
-    fn normalize_rejects_nonzero_seconds() {
         assert!(normalize_cron_expression("*/30 * * * * *").is_err());
-    }
-
-    #[test]
-    fn field_parser_supports_steps_ranges_and_names() {
         let schedule = CronSchedule::parse("*/15 9-17 * JAN MON-FRI").unwrap();
 
         assert!(schedule.minutes.matches(0));
@@ -270,11 +262,7 @@ mod tests {
         assert!(schedule.weekdays.matches(1));
         assert!(schedule.weekdays.matches(5));
         assert!(!schedule.weekdays.matches(6));
-    }
-
-    #[test]
-    fn weekday_seven_matches_sunday_zero() {
-        let schedule = CronSchedule::parse("0 0 * * 7").unwrap();
-        assert!(schedule.weekdays.matches(0));
+        let sunday = CronSchedule::parse("0 0 * * 7").unwrap();
+        assert!(sunday.weekdays.matches(0));
     }
 }

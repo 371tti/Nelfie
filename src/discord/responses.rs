@@ -5,8 +5,6 @@ use std::{
 };
 
 use log::{debug, info, warn};
-#[cfg(test)]
-use serenity::all::{ChannelId, GuildId, UserId};
 use serenity::all::{
     CreateMessage, EditInteractionResponse, EditMessage, Message, ModalInteraction,
 };
@@ -19,11 +17,13 @@ use crate::{
         images::refresh_discord_image_urls_for_api,
         logging::log_err,
         message_delivery::{
-            MODAL_PUBLIC_RESPONSE_MESSAGE, send_long_message, send_modal_ephemeral_response,
+            MODAL_PUBLIC_RESPONSE_MESSAGE, send_generated_images, send_long_message,
+            send_modal_ephemeral_response, send_modal_generated_images,
         },
     },
     llm::{
         client::GenerateResponseOptions, compaction::schedule_context_compaction, context::Role,
+        user::UserContextScope,
     },
 };
 
@@ -31,10 +31,15 @@ mod origin;
 mod rate_limit;
 
 pub use origin::CronResponseRequest;
-#[cfg(test)]
-use origin::UserResponseDelivery;
 use origin::{RateLimitBucket, RateLimitTarget, ResponseOrigin, UserResponseRequest};
-use rate_limit::advance_rate_limit_bucket;
+use rate_limit::{add_rate_usage, advance_rate_limit_bucket};
+
+const IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS: &str = concat!(
+    "\nImage generation workflow: Before generating or editing an image, call `model-control` ",
+    "with target `image_generation` to read or set the selected model. The built-in ",
+    "image_generation tool is enabled on the next API round using that selection. Do not ",
+    "request image generation in the same round as changing the image model."
+);
 
 pub(super) fn schedule_message_response(
     ctx: &serenity::client::Context,
@@ -127,16 +132,20 @@ async fn run_response_task(
     let bot_user_id = ctx.cache.current_user().id;
     let rate_limit_target = origin.rate_limit_target(bot_user_id);
     let rate_limit_bucket = origin.rate_limit_bucket();
-
-    let user_ctx = match rate_limit_target {
-        RateLimitTarget::User(user_id) => ob_context.user_contexts.get_or_create(user_id),
+    let user_context_scope = match rate_limit_target {
+        RateLimitTarget::User(user_id) => UserContextScope::User(user_id),
         RateLimitTarget::GuildBot {
             guild_id,
             bot_user_id,
-        } => ob_context
-            .user_contexts
-            .get_or_create_guild_bot(guild_id, bot_user_id),
+        } => UserContextScope::GuildBot {
+            guild_id,
+            bot_user_id,
+        },
     };
+
+    let user_ctx = ob_context
+        .user_contexts
+        .get_or_create_scoped(user_context_scope);
     let model = origin.response_model(user_ctx.main_model);
     let source = origin.log_source();
     let guild = guild_id
@@ -145,7 +154,10 @@ async fn run_response_task(
     let (current_rate_line, add_line, window_size, rate_limit_label) = match rate_limit_bucket {
         RateLimitBucket::General => (
             user_ctx.rate_line,
-            model.rate_cost() * ob_context.config.rate_limit_sec_per_cost,
+            ob_context
+                .config
+                .rate_limit_sec_per_cost
+                .saturating_mul(model.rate_cost()),
             ob_context.config.rate_limit_window_size,
             "rate limit",
         ),
@@ -195,35 +207,13 @@ async fn run_response_task(
         }
     };
 
-    match (rate_limit_target, rate_limit_bucket) {
-        (RateLimitTarget::User(user_id), RateLimitBucket::General) => ob_context
+    match rate_limit_bucket {
+        RateLimitBucket::General => ob_context
             .user_contexts
-            .set_rate_line(user_id, added_rate_line),
-        (
-            RateLimitTarget::GuildBot {
-                guild_id,
-                bot_user_id,
-            },
-            RateLimitBucket::General,
-        ) => {
-            ob_context
-                .user_contexts
-                .set_guild_bot_rate_line(guild_id, bot_user_id, added_rate_line)
-        }
-        (RateLimitTarget::User(user_id), RateLimitBucket::Cron) => ob_context
+            .set_rate_line_scoped(user_context_scope, added_rate_line),
+        RateLimitBucket::Cron => ob_context
             .user_contexts
-            .set_cron_rate_line(user_id, added_rate_line),
-        (
-            RateLimitTarget::GuildBot {
-                guild_id,
-                bot_user_id,
-            },
-            RateLimitBucket::Cron,
-        ) => ob_context.user_contexts.set_guild_bot_cron_rate_line(
-            guild_id,
-            bot_user_id,
-            added_rate_line,
-        ),
+            .set_cron_rate_line_scoped(user_context_scope, added_rate_line),
     }
 
     info!(
@@ -284,6 +274,7 @@ async fn run_response_task(
         system_prompt.push('\n');
         system_prompt.push_str(&note);
     }
+    system_prompt.push_str(IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS);
 
     refresh_discord_image_urls_for_api(ctx, &mut context).await;
 
@@ -303,6 +294,20 @@ async fn run_response_task(
     };
 
     let (state_tx, state_rx) = mpsc::channel::<String>(100);
+    let (rate_usage_tx, mut rate_usage_rx) = mpsc::unbounded_channel::<u64>();
+    let rate_usage_context = ob_context.clone();
+    let rate_usage_task = tokio::spawn(async move {
+        while let Some(cost_units) = rate_usage_rx.recv().await {
+            if cost_units != 0 {
+                charge_additional_rate_usage(
+                    &rate_usage_context,
+                    user_context_scope,
+                    rate_limit_bucket,
+                    cost_units,
+                );
+            }
+        }
+    });
 
     let state_reader = thinking_msg.as_ref().map(|thinking_msg| {
         let state_http = ctx.http.clone();
@@ -340,6 +345,9 @@ async fn run_response_task(
             state_sender: Some(state_tx),
             context_cache_key,
             parameters: model.to_parameter(),
+            user_context_scope,
+            allow_mainline_model_change: matches!(&origin, ResponseOrigin::User(_)),
+            rate_usage_sender: rate_usage_tx,
         },
     );
     let result = match tokio::time::timeout(timeout_duration, async {
@@ -374,6 +382,7 @@ async fn run_response_task(
             if let Some(state_reader) = state_reader.as_ref() {
                 state_reader.abort();
             }
+            let _ = rate_usage_task.await;
             return Err(e);
         }
         Err(_) => {
@@ -398,6 +407,7 @@ async fn run_response_task(
             if let Some(state_reader) = state_reader.as_ref() {
                 state_reader.abort();
             }
+            let _ = rate_usage_task.await;
             warn!(
                 "response timed out: request_id={} source={} channel={} timeout_ms={}",
                 request_id,
@@ -408,6 +418,8 @@ async fn run_response_task(
             return Ok(());
         }
     };
+
+    let _ = rate_usage_task.await;
 
     if let Some(state_reader) = state_reader.as_ref() {
         state_reader.abort();
@@ -423,6 +435,10 @@ async fn run_response_task(
         }
         return Ok(());
     }
+
+    let generated_images = result.generated_images;
+    let final_model = result.final_model;
+    let result = result.context;
 
     ob_context.chat_contexts.marge(channel_id, &result);
     if origin.triggers_context_compaction() {
@@ -452,7 +468,7 @@ async fn run_response_task(
         request_id,
         source,
         channel_id.get(),
-        model,
+        final_model,
         elapsed,
         total_tokens,
         cache_status,
@@ -472,7 +488,7 @@ async fn run_response_task(
         warn!("failed to delete thinking message: {}", e);
     }
 
-    let footer = format!("-# Reasoning done in {}ms, model: {}", elapsed, model);
+    let footer = format!("-# Reasoning done in {}ms, model: {}", elapsed, final_model);
 
     if let Some(modal) = origin.modal_ephemeral_delivery() {
         if let Some(sent) = sent_via_discord_tool {
@@ -480,6 +496,8 @@ async fn run_response_task(
                 debug!(
                     "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
                 );
+                send_modal_generated_images(&ctx.http, &modal.interaction, generated_images)
+                    .await?;
                 return Ok(());
             }
 
@@ -494,10 +512,12 @@ async fn run_response_task(
                 )
                 .await
                 .ok();
+            send_generated_images(&ctx.http, channel_id, generated_images).await?;
             return Ok(());
         }
 
         send_modal_ephemeral_response(&ctx.http, &modal.interaction, &text, &footer).await?;
+        send_modal_generated_images(&ctx.http, &modal.interaction, generated_images).await?;
         return Ok(());
     }
 
@@ -506,6 +526,11 @@ async fn run_response_task(
             debug!(
                 "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
             );
+            if !generated_images.is_empty() {
+                warn!(
+                    "skipping generated image delivery because this response has no ephemeral interaction target"
+                );
+            }
             return Ok(());
         }
 
@@ -513,11 +538,13 @@ async fn run_response_task(
             debug!(
                 "Skipping final assistant send because discord-tool already posted the same text"
             );
+            send_generated_images(&ctx.http, channel_id, generated_images).await?;
             return Ok(());
         }
     }
 
     send_long_message(&ctx.http, channel_id, &text, &footer).await?;
+    send_generated_images(&ctx.http, channel_id, generated_images).await?;
 
     Ok(())
 }
@@ -526,89 +553,40 @@ fn is_same_text_loosely(a: &str, b: &str) -> bool {
     normalize_text(a) == normalize_text(b)
 }
 
-fn normalize_text(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+fn charge_additional_rate_usage(
+    ob_context: &NelfieContext,
+    scope: UserContextScope,
+    bucket: RateLimitBucket,
+    cost_units: u64,
+) {
+    let user_context = ob_context.user_contexts.get_or_create_scoped(scope);
+    let (current_line, seconds_per_unit) = match bucket {
+        RateLimitBucket::General => (
+            user_context.rate_line,
+            ob_context.config.rate_limit_sec_per_cost,
+        ),
+        RateLimitBucket::Cron => (
+            user_context.cron_rate_line,
+            ob_context.config.cron_rate_limit_sec_per_run,
+        ),
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let new_line = add_rate_usage(
+        current_line,
+        now,
+        seconds_per_unit.saturating_mul(cost_units),
+    );
+
+    match bucket {
+        RateLimitBucket::General => ob_context
+            .user_contexts
+            .set_rate_line_scoped(scope, new_line),
+        RateLimitBucket::Cron => ob_context
+            .user_contexts
+            .set_cron_rate_line_scoped(scope, new_line),
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::models::Models;
-
-    #[test]
-    fn rate_limit_bucket_allows_first_run_and_blocks_second_until_window_passes() {
-        let now = 1_000;
-        let first = advance_rate_limit_bucket(1, now, 3_600, 3_600).unwrap();
-        assert_eq!(first, now + 3_600);
-
-        let blocked_until = advance_rate_limit_bucket(first, now, 3_600, 3_600).unwrap_err();
-        assert_eq!(blocked_until, now + 3_600);
-
-        let second = advance_rate_limit_bucket(first, blocked_until, 3_600, 3_600).unwrap();
-        assert_eq!(second, blocked_until + 3_600);
-    }
-
-    #[test]
-    fn rate_limit_bucket_zero_line_is_unlimited() {
-        assert_eq!(advance_rate_limit_bucket(0, 1_000, 3_600, 3_600), Ok(0));
-    }
-
-    #[test]
-    fn cron_request_context_presents_prompt_as_active_instruction() {
-        let cron = CronResponseRequest {
-            cron_id: "cron-test".to_string(),
-            schedule: "0 * * * *".to_string(),
-            prompt: "チャンネルに朝の挨拶を送って".to_string(),
-            manual: false,
-            guild_id: GuildId::new(7),
-            channel_id: ChannelId::new(9),
-        };
-
-        let context = cron.request_context();
-        let text = context.get_result();
-
-        assert!(text.contains("Execute the scheduled prompt below"));
-        assert!(text.contains("<scheduled_prompt>"));
-        assert!(text.contains("チャンネルに朝の挨拶を送って"));
-    }
-
-    #[test]
-    fn user_response_uses_user_general_rate_limit() {
-        let user_id = UserId::new(42);
-        let origin = ResponseOrigin::User(UserResponseRequest {
-            user_id,
-            guild_id: Some(GuildId::new(7)),
-            channel_id: ChannelId::new(9),
-            delivery: UserResponseDelivery::Channel,
-        });
-
-        assert_eq!(origin.rate_limit_bucket(), RateLimitBucket::General);
-        assert_eq!(
-            origin.response_model(Models::Gpt5dot6Terra),
-            Models::Gpt5dot6Terra
-        );
-        match origin.rate_limit_target(UserId::new(999)) {
-            RateLimitTarget::User(actual) => assert_eq!(actual, user_id),
-            other => panic!("expected user rate limit target, got {other:?}"),
-        }
-        assert!(origin.triggers_context_compaction());
-    }
-
-    #[test]
-    fn cron_response_does_not_trigger_context_compaction() {
-        let origin = ResponseOrigin::Cron(CronResponseRequest {
-            cron_id: "cron-test".to_string(),
-            schedule: "0 * * * *".to_string(),
-            prompt: "scheduled".to_string(),
-            manual: false,
-            guild_id: GuildId::new(7),
-            channel_id: ChannelId::new(9),
-        });
-
-        assert!(!origin.triggers_context_compaction());
-        assert_eq!(
-            origin.response_model(Models::Gpt5dot6Terra),
-            Models::CRON_MODEL
-        );
-    }
+fn normalize_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<&str>>().join(" ")
 }

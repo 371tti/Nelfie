@@ -13,7 +13,7 @@ use serenity::all::ChannelId;
 use tokio::task::AbortHandle;
 
 use crate::{
-    app::{config::Config, cron::CronScheduler},
+    app::{config::Config, cron::CronScheduler, monitoring::MonitoringState},
     discord::client::DiscordClientContext,
     llm::channel::ChatContexts,
     llm::tools,
@@ -34,6 +34,7 @@ pub struct NelfieContext {
     pub tools: Arc<HashMap<String, Box<dyn LMTool>>>,
     pub discord_client: Arc<DiscordClientContext>,
     pub cron_scheduler: Arc<CronScheduler>,
+    pub monitoring: Arc<MonitoringState>,
     pub responding_channels: Arc<DashMap<ChannelId, bool>>,
     pub active_responses: Arc<DashMap<ChannelId, ActiveResponse>>,
     pub response_seq: Arc<AtomicU64>,
@@ -74,6 +75,7 @@ impl NelfieContext {
             tools: Arc::new(tools),
             discord_client: Arc::new(DiscordClientContext::default()),
             cron_scheduler: Arc::new(CronScheduler::new()),
+            monitoring: Arc::new(MonitoringState::new()),
             responding_channels: Arc::new(DashMap::new()),
             active_responses: Arc::new(DashMap::new()),
             response_seq: Arc::new(AtomicU64::new(1)),
@@ -85,6 +87,8 @@ impl NelfieContext {
     }
 
     pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.monitoring.mark_gateway_disconnected();
+        self.monitoring.set_voicevox_ready(false);
         for active in self.active_responses.iter() {
             active.abort_handle.abort();
         }

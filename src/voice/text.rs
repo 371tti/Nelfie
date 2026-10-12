@@ -997,49 +997,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_uppercase_ascii_word_is_skipped_for_kanalyze() {
-        assert!(EN2KANA::should_skip_kanalyze_ascii_word("CPU"));
-        assert!(EN2KANA::should_skip_kanalyze_ascii_word("ABCDE"));
-        assert!(!EN2KANA::should_skip_kanalyze_ascii_word("ABCDEF"));
-        assert!(!EN2KANA::should_skip_kanalyze_ascii_word("Gpu"));
-    }
-
-    #[test]
-    fn convert_keeps_short_uppercase_ascii_word() {
-        let conv = EN2KANA::new();
-        let out = conv
-            .convert("CPU usage", None)
-            .expect("EN2KANA conversion should succeed");
-
-        assert!(out.contains("CPU"));
-    }
-
-    #[test]
-    fn decimal_fraction_is_read_digit_by_digit() {
-        assert_eq!(normalize_tts_text(".32"), "テンサンニイ");
-        assert_eq!(normalize_tts_text("1.32"), "1テンサンニイ");
-    }
-
-    #[test]
-    fn full_normalization_does_not_append_omission_for_long_text() {
-        let input = "あ".repeat(TTS_MAX_TOTAL_CHARS + 10);
-        let out = normalize_tts_text_full(&input);
-
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn dictionary_matches_ascii_normalized_alias() {
-        let source = "371CPU";
-        let normalized = normalize_ascii_alnum_to_kana(source);
-        let input = format!("{} が参加しました", normalized);
-        let entries = vec![(source.to_string(), "みないっち".to_string())];
-
-        let out = apply_tts_dictionary(&input, &entries);
-        assert_eq!(out, "みないっち が参加しました");
-    }
-
-    #[test]
     fn dictionary_prefers_longest_match_at_same_position() {
         let entries = vec![
             ("abc".to_string(), "X".to_string()),

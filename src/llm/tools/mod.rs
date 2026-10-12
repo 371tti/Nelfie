@@ -7,6 +7,7 @@ pub mod discord;
 pub mod get_time;
 pub mod latex;
 pub mod modal_builder;
+pub mod model_control;
 pub mod voicevox;
 
 pub fn registry() -> HashMap<String, Box<dyn LMTool>> {
@@ -16,6 +17,7 @@ pub fn registry() -> HashMap<String, Box<dyn LMTool>> {
         Box::new(discord::DiscordTool::new()),
         Box::new(latex::LatexExprRenderTool::new()),
         Box::new(modal_builder::ModalBuilderTool::new()),
+        Box::new(model_control::ModelControlTool::new()),
         Box::new(voicevox::VoicevoxTool::new()),
     ];
 

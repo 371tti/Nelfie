@@ -53,6 +53,7 @@ VOICEVOX_VVM_DIR=voicevox_core/models/vvms
 # 実行時リンク(load-onnxruntime)では voicevox_onnxruntime を自動探索してロードします
 # 通常は未設定でOK。明示パス/ファイル名を指定したい場合のみ設定してください
 VOICEVOX_ONNXRUNTIME_FILENAME=
+MONITOR_TCP_BIND=127.0.0.1:9791
 ```
 
 3. 起動
@@ -68,6 +69,35 @@ v0.1.4以降はserenityの起動とdownloaderの起動が直列化しました�
 `DISCORD_TOKEN` と `OPENAI_API_KEY` は未設定だと起動時にエラーになります。
 
 ログは既定でNelfie自身を`INFO`、serenityなどの依存ライブラリを`WARN`以上に絞ります。端末では`INFO`や`WARN`などのレベルを自動で色分けし、`RUST_LOG_STYLE=always`または`never`で明示できます。モデル応答はANSIエスケープ列と制御文字を除去して1行で記録します。詳細調査時は`RUST_LOG=warn,nelfie=debug`、依存ライブラリも含める場合は標準の`RUST_LOG`フィルタ構文で対象モジュールを追加してください。
+
+## TCP監視
+
+身内用機能です。
+
+Nelfieは`MONITOR_TCP_BIND`で指定したアドレスにTCP監視サーバーを起動します。既定は`127.0.0.1:9791`です。監視サーバーから接続し、`METRICS\n`を送ると、key-value形式のメトリクスを返します。応答は空行で終わります。
+
+`192.168.0.254`で待ち受ける場合は、Nelfie側の`.env`にも`MONITOR_TCP_BIND=192.168.0.254:9791`を設定してください。
+
+```yaml
+- id: "discord-bot.nelfie"
+  name: "nelfie"
+  type: tcp
+  host: "192.168.0.254"
+  port: 9791
+  interval: 60
+  timeout: 5
+  slow_ms: 500
+  hide_target: true
+  exclude_status: false
+  send: "METRICS\n"
+  response_end: "\n\n"
+  order: 200
+  max_bytes: 16384
+  response_codes:
+    0: operational
+    1: degraded
+    2: down
+```
 
 ## 主なコマンド
 
@@ -101,17 +131,21 @@ VC / TTS:
 - `/vc config [system_read] [auto_read] [parallel_count]`: システム読み上げ、自動読み上げ、並列数を更新します。省略した項目は現在の設定を維持します。
 - `/vc autoread <enabled>`: このテキストチャンネルでの自動読み上げの有効/無効を切り替えます。
 - `/vc dict <source> <target>`: このテキストチャンネルの読み上げ辞書を登録または更新します。
+- `/vc dict-list`: このテキストチャンネルの読み上げ辞書を登録者・最終更新者とともに10件ずつ表示します。ボタンでページを切り替えられます。
 - `/vc dict-delete <source>`: このテキストチャンネルの読み上げ辞書エントリを削除します。
 - `/vc dict-user <source> <target>`: 自分用の読み上げ辞書を登録または更新します。
+- `/vc dict-user-list`: 自分用の読み上げ辞書を登録者・最終更新者とともに10件ずつ表示します。ボタンでページを切り替えられ、スラッシュコマンドでは本人にだけ表示します。
 - `/vc dict-user-delete <source>`: 自分用の読み上げ辞書エントリを削除します。
 - `/vc speaker <speaker> <style> [speed] [pitch] [pan]`: 自分の話者、スタイル、話速、音高、左右パンを設定します。
 - `/vc status`: 現在の VC 状態と VOICEVOX 設定を表示します。
 
 cron は実行環境のローカル時刻で、標準的な 5 フィールド表記（例: `*/30 * * * *`）を使います。prefix command では `cron add "*/30 * * * *" <prompt>` のように cron 表記を引用してください。AI も `cron-tool` で cron の作成・一覧・削除を行えます。cron 実行は通常応答とは別の guild 単位 cron バケットで制御され、標準設定では 1 guild あたりおおむね 1 時間に 1 回実行できます。通常の `/rate config` は一般応答用のレート制限だけを変更します。
 
-利用可能なモデルには `gpt-5.6-luna`（cost x3）、`gpt-5.6-terra`（cost x6）、`gpt-5.6-sol`（cost x9）を含みます。モデル一覧と現在モデルでは、レート制限で消費するコストを `xN` 形式で表示します。ユーザー既定、システム、cron、context要約のモデルは `Models` の `USER_DEFAULT_MODEL`、`SYSTEM_MODEL`、`CRON_MODEL`、`CONTEXT_SUMMARY_MODEL` で用途別に定義します。現在はいずれも `gpt-5.6-luna` です。
+利用可能なモデルのレート係数は `gpt-6-luna` が x1、`gpt-5.6-terra`、`gpt-6-sol`、`gpt-6.1-sol` が x20 です。アプリのレート制限は実際のtoken数ではなく、モデルごとの固定コスト係数を使います。実際のAPI請求額はtoken数や長文context向け価格によって変わります。モデル一覧と現在モデルでは、レート制限で消費するコストを `xN` 形式で表示します。ユーザー既定、システム、cron、context要約のモデルは `Models` の `USER_DEFAULT_MODEL`、`SYSTEM_MODEL`、`CRON_MODEL`、`CONTEXT_SUMMARY_MODEL` で用途別に定義します。現在はいずれも `gpt-6-luna` です。
 
-通常応答はチャンネルごとに安定した`prompt_cache_key`を送信して、同じ会話contextのprefix cacheを再利用します。5.6系モデルではさらに`prompt_cache_retention=24h`を明示してextended prompt cacheを有効化します。APIが返す`cached_tokens`はtool-callを含む全ラウンドで集計し、応答完了ログへ`prompt_cache=hit`または`prompt_cache=miss`とともに表示します。
+`model-control` ツールで mainline Responses モデルと画像生成モデルを切り替えられます。画像生成モデルの初期値は `gpt-image-2.5-flare` です。画像生成前にモデル設定を読み取るか変更し、次のResponses APIラウンドで設定済みモデルを使うネイティブ `image_generation` ツールを有効にします。推論レベルは常に `low` です。画像生成の開始1回ごとに追加でレート枠を1単位消費します。スラッシュコマンドでは `/model get` と `/model image-set` で確認・変更できます。
+
+通常応答はチャンネルごとに安定した`prompt_cache_key`を送信して、同じ会話contextのprefix cacheを再利用します。5.6系モデルではさらに`prompt_cache_retention=24h`を明示してextended prompt cacheを有効化します。GPT-6系モデルはAPIの標準cache制御を使います。APIが返す`cached_tokens`はtool-callを含む全ラウンドで集計し、応答完了ログへ`prompt_cache=hit`または`prompt_cache=miss`とともに表示します。
 
 会話履歴は固定件数のローリングウィンドウでは削除しません。ユーザー起点のAI応答が成功した時だけ、OpenAI APIが返す `usage.total_tokens` を確認し、`CONTEXT_COMPACTION_TOKEN_LIMIT` 以上なら古い側のおよそ半分を `Models::CONTEXT_SUMMARY_MODEL` で非同期要約します。通常メッセージの流入やcron実行だけでは要約を開始しません。要約中に追加された新しい履歴は残し、同じチャンネルでは複数の要約を同時実行しません。要約の最大出力token数は `CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS` で設定します。
 

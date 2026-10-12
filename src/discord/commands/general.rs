@@ -4,7 +4,11 @@ use log::{error, info};
 use poise::CreateReply;
 use serenity::all::{CreateAttachment, CreateEmbed};
 
-use crate::llm::{models::Models, tools::latex::LatexExprRenderTool};
+use crate::llm::{
+    models::{ImageGenerationModels, Models},
+    tools::latex::LatexExprRenderTool,
+    user::UserContextScope,
+};
 
 use super::shared::{Context, Error};
 
@@ -138,7 +142,11 @@ pub async fn disable(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// model config command
-#[poise::command(slash_command, prefix_command, subcommands("get", "set", "list"))]
+#[poise::command(
+    slash_command,
+    prefix_command,
+    subcommands("get", "set", "image_set", "list")
+)]
 pub async fn model(_: Context<'_>) -> Result<(), Error> {
     Ok(()) // ここはメインでは使わない
 }
@@ -147,11 +155,12 @@ pub async fn model(_: Context<'_>) -> Result<(), Error> {
 pub async fn get(ctx: Context<'_>) -> Result<(), Error> {
     let ob_ctx = ctx.data();
     let user_id = ctx.author().id;
-    let model = ob_ctx.user_contexts.get_or_create(user_id).main_model;
+    let settings = ob_ctx.user_contexts.get_or_create(user_id);
     ctx.say(format!(
-        "現在のモデル: `{}` / cost **x{}**",
-        model,
-        model.rate_cost()
+        "Mainline: `{}` / cost **x{}**\nImage generation: `{}`",
+        settings.main_model,
+        settings.main_model.rate_cost(),
+        settings.image_generation_model,
     ))
     .await?;
     Ok(())
@@ -161,13 +170,43 @@ pub async fn get(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn list(ctx: Context<'_>) -> Result<(), Error> {
     let models = Models::list();
 
-    let mut s = String::from("**利用可能なモデル:**\n");
+    let mut s = String::from("**Mainline LLM models:**\n");
     for m in models {
         s.push_str(&format!("- `{}` / cost **x{}**\n", m, m.rate_cost()));
+    }
+    s.push_str("\n**Image generation models:**\n");
+    for model in ImageGenerationModels::list() {
+        s.push_str(&format!("- `{model}`\n"));
     }
 
     ctx.say(s).await?;
     Ok(())
+}
+
+#[poise::command(slash_command, prefix_command, rename = "image-set")]
+pub async fn image_set(
+    ctx: Context<'_>,
+    #[description = "Choose an image generation model"]
+    #[autocomplete = "autocomplete_image_model_name"]
+    model_name: String,
+) -> Result<(), Error> {
+    let model = ImageGenerationModels::from_name(&model_name)
+        .ok_or_else(|| format!("利用できない画像生成モデルです: `{model_name}`"))?;
+    let ob_ctx = ctx.data();
+    ob_ctx
+        .user_contexts
+        .set_image_generation_model_scoped(UserContextScope::User(ctx.author().id), model);
+    ctx.say(format!("画像生成モデルを `{model}` に変更しました。"))
+        .await?;
+    Ok(())
+}
+
+async fn autocomplete_image_model_name(_ctx: Context<'_>, partial: &str) -> Vec<String> {
+    ImageGenerationModels::list()
+        .into_iter()
+        .map(|model| model.to_string())
+        .filter(|model| model.starts_with(partial))
+        .collect()
 }
 
 #[poise::command(slash_command, prefix_command)]
@@ -179,7 +218,8 @@ pub async fn set(
 ) -> Result<(), Error> {
     let ob_ctx = ctx.data();
     let user_id = ctx.author().id;
-    let model = Models::from(model_name);
+    let model = Models::from_name(&model_name)
+        .ok_or_else(|| format!("利用できないモデルです: `{model_name}`"))?;
     ob_ctx.user_contexts.set_model(user_id, model);
 
     ctx.say(format!(

@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use log::info;
+use log::{error, info};
 use serenity::{Client, all::GatewayIntents};
 use songbird::SerenityInit;
 
@@ -60,9 +60,23 @@ pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + S
         .register_songbird()
         .framework(framework);
 
+    let monitoring = ob_ctx.monitoring.clone();
     tokio::spawn(async move {
-        let mut client = discord_client.await.expect("Error creating client");
-        client.start().await.expect("Error starting client");
+        let mut client = match discord_client.await {
+            Ok(client) => client,
+            Err(error) => {
+                error!("failed to create Discord client: {error}");
+                monitoring.mark_gateway_disconnected();
+                return;
+            }
+        };
+        ob_ctx
+            .discord_client
+            .install_shard_manager(client.shard_manager.clone());
+        if let Err(error) = client.start().await {
+            error!("Discord client stopped with an error: {error}");
+        }
+        monitoring.mark_gateway_disconnected();
     });
 
     Ok(())

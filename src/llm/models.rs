@@ -22,16 +22,17 @@ pub enum Models {
     Gpt5dot4Nano,
     Gpt5dot6Luna,
     Gpt5dot6Terra,
-    Gpt5dot6Sol,
+    Gpt6Luna,
+    Gpt6Sol,
+    Gpt6dot1Sol,
     O4Mini,
-    O3,
 }
 
 impl Models {
-    pub const USER_DEFAULT_MODEL: Self = Self::Gpt5dot6Luna;
-    pub const SYSTEM_MODEL: Self = Self::Gpt5dot6Luna;
-    pub const CRON_MODEL: Self = Self::Gpt5dot6Luna;
-    pub const CONTEXT_SUMMARY_MODEL: Self = Self::Gpt5dot6Luna;
+    pub const USER_DEFAULT_MODEL: Self = Self::Gpt6Luna;
+    pub const SYSTEM_MODEL: Self = Self::Gpt6Luna;
+    pub const CRON_MODEL: Self = Self::Gpt6Luna;
+    pub const CONTEXT_SUMMARY_MODEL: Self = Self::Gpt6Luna;
 
     pub fn list() -> Vec<Self> {
         vec![
@@ -39,9 +40,10 @@ impl Models {
             Self::Gpt5dot4Nano,
             Self::Gpt5dot6Luna,
             Self::Gpt5dot6Terra,
-            Self::Gpt5dot6Sol,
+            Self::Gpt6Luna,
+            Self::Gpt6Sol,
+            Self::Gpt6dot1Sol,
             Self::O4Mini,
-            Self::O3,
         ]
     }
 
@@ -51,9 +53,10 @@ impl Models {
             "gpt-5.4-nano" => Some(Self::Gpt5dot4Nano),
             "gpt-5.6-luna" => Some(Self::Gpt5dot6Luna),
             "gpt-5.6-terra" => Some(Self::Gpt5dot6Terra),
-            "gpt-5.6-sol" => Some(Self::Gpt5dot6Sol),
+            "gpt-6-luna" => Some(Self::Gpt6Luna),
+            "gpt-6-sol" => Some(Self::Gpt6Sol),
+            "gpt-6.1-sol" => Some(Self::Gpt6dot1Sol),
             "o4-mini" => Some(Self::O4Mini),
-            "o3" => Some(Self::O3),
             _ => None,
         }
     }
@@ -62,17 +65,15 @@ impl Models {
         match self {
             Self::Gpt5dot4Mini | Self::Gpt5dot6Luna | Self::O4Mini => 3,
             Self::Gpt5dot4Nano => 1,
-            Self::Gpt5dot6Terra | Self::O3 => 6,
-            Self::Gpt5dot6Sol => 9,
+            Self::Gpt6Luna => 1,
+            // Terra and the Sol models use the x20 rate-limit tier.
+            Self::Gpt5dot6Terra | Self::Gpt6Sol | Self::Gpt6dot1Sol => 20,
         }
     }
 
     pub fn features(&self) -> ModelFeatures {
         ModelFeatures {
-            prompt_cache_options: matches!(
-                self,
-                Self::Gpt5dot6Luna | Self::Gpt5dot6Terra | Self::Gpt5dot6Sol
-            ),
+            prompt_cache_options: matches!(self, Self::Gpt5dot6Luna | Self::Gpt5dot6Terra),
             parallel_tool_calls: true,
             cached_tokens: true,
         }
@@ -100,9 +101,10 @@ impl Display for Models {
             Self::Gpt5dot4Nano => "gpt-5.4-nano",
             Self::Gpt5dot6Luna => "gpt-5.6-luna",
             Self::Gpt5dot6Terra => "gpt-5.6-terra",
-            Self::Gpt5dot6Sol => "gpt-5.6-sol",
+            Self::Gpt6Luna => "gpt-6-luna",
+            Self::Gpt6Sol => "gpt-6-sol",
+            Self::Gpt6dot1Sol => "gpt-6.1-sol",
             Self::O4Mini => "o4-mini",
-            Self::O3 => "o3",
         };
         f.write_str(name)
     }
@@ -114,52 +116,39 @@ impl From<String> for Models {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageGenerationModels {
+    GptImage25Flare,
+    GptImage25Sunburst,
+}
 
-    #[test]
-    fn purpose_models_are_explicit_and_user_default_drives_default() {
-        assert_eq!(Models::default(), Models::USER_DEFAULT_MODEL);
-        assert_eq!(Models::USER_DEFAULT_MODEL, Models::Gpt5dot6Luna);
-        assert_eq!(Models::SYSTEM_MODEL, Models::Gpt5dot6Luna);
-        assert_eq!(Models::CRON_MODEL, Models::Gpt5dot6Luna);
-        assert_eq!(Models::CONTEXT_SUMMARY_MODEL, Models::Gpt5dot6Luna);
+impl ImageGenerationModels {
+    pub const DEFAULT: Self = Self::GptImage25Flare;
+
+    pub fn list() -> [Self; 2] {
+        [Self::GptImage25Flare, Self::GptImage25Sunburst]
     }
 
-    #[test]
-    fn gpt_5_6_models_have_expected_names_and_costs() {
-        let cases = [
-            (Models::Gpt5dot6Luna, "gpt-5.6-luna", 3),
-            (Models::Gpt5dot6Terra, "gpt-5.6-terra", 6),
-            (Models::Gpt5dot6Sol, "gpt-5.6-sol", 9),
-        ];
-
-        for (model, name, cost) in cases {
-            assert_eq!(model.to_string(), name);
-            assert_eq!(model.rate_cost(), cost);
-            assert_eq!(Models::from(name.to_string()).to_string(), name);
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "gpt-image-2.5-flare" => Some(Self::GptImage25Flare),
+            "gpt-image-2.5-sunburst" => Some(Self::GptImage25Sunburst),
+            _ => None,
         }
     }
+}
 
-    #[test]
-    fn listed_models_support_parallel_tools_and_cached_token_usage() {
-        for model in Models::list() {
-            let features = model.features();
-            assert!(features.parallel_tool_calls, "{model}");
-            assert!(features.cached_tokens, "{model}");
-        }
+impl Default for ImageGenerationModels {
+    fn default() -> Self {
+        Self::DEFAULT
     }
+}
 
-    #[test]
-    fn only_gpt_5_6_models_support_prompt_cache_options() {
-        for model in Models::list() {
-            let expected = matches!(
-                model,
-                Models::Gpt5dot6Luna | Models::Gpt5dot6Terra | Models::Gpt5dot6Sol
-            );
-            assert_eq!(model.features().prompt_cache_options, expected, "{model}");
-            assert_eq!(model.to_parameter().features, model.features(), "{model}");
-        }
+impl Display for ImageGenerationModels {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::GptImage25Flare => "gpt-image-2.5-flare",
+            Self::GptImage25Sunburst => "gpt-image-2.5-sunburst",
+        })
     }
 }

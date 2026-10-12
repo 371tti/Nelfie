@@ -3,6 +3,7 @@ use serenity::all::ChannelId;
 use tokio::time::{Duration, timeout};
 
 use crate::app::context::NelfieContext;
+use crate::llm::models::Models;
 
 pub fn schedule_context_compaction(ob_context: &NelfieContext, channel_id: ChannelId) {
     let Some((compaction_id, compaction)) = ob_context
@@ -33,10 +34,11 @@ pub fn schedule_context_compaction(ob_context: &NelfieContext, channel_id: Chann
                     &summary,
                 ) {
                     info!(
-                        "context compacted: channel={} source_items={} summary_chars={} model=gpt-5.6-luna",
+                        "context compacted: channel={} source_items={} summary_chars={} model={}",
                         channel_id.get(),
                         source_item_count,
-                        summary.chars().count()
+                        summary.chars().count(),
+                        Models::CONTEXT_SUMMARY_MODEL
                     );
                 } else {
                     warn!(

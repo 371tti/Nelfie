@@ -3214,10 +3214,11 @@ dependencies = [
 
 [[package]]
 name = "nelfie"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-openai",
  "async-trait",
+ "base64",
  "chrono",
  "chrono-tz",
  "dashmap 6.2.1",

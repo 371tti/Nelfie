@@ -67,6 +67,41 @@ pub(super) async fn send_long_message(
     Ok(())
 }
 
+pub(super) async fn send_generated_images(
+    http: &serenity::http::Http,
+    channel_id: serenity::all::ChannelId,
+    images: Vec<Vec<u8>>,
+) -> Result<(), serenity::Error> {
+    for attachment in generated_image_attachments(images) {
+        channel_id
+            .send_message(http, CreateMessage::new().add_file(attachment))
+            .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn send_modal_generated_images(
+    http: &serenity::http::Http,
+    modal: &ModalInteraction,
+    images: Vec<Vec<u8>>,
+) -> Result<(), serenity::Error> {
+    for attachment in generated_image_attachments(images) {
+        let followup = CreateInteractionResponseFollowup::new()
+            .content("生成画像")
+            .add_file(attachment)
+            .ephemeral(true);
+        modal.create_followup(http, followup).await?;
+    }
+    Ok(())
+}
+
+fn generated_image_attachments(images: Vec<Vec<u8>>) -> impl Iterator<Item = CreateAttachment> {
+    images.into_iter().enumerate().filter_map(|(index, image)| {
+        (!image.is_empty())
+            .then(|| CreateAttachment::bytes(image, format!("generated-image-{}.png", index + 1)))
+    })
+}
+
 pub(super) async fn send_modal_ephemeral_response(
     http: &serenity::http::Http,
     modal: &ModalInteraction,

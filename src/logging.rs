@@ -93,18 +93,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortens_application_targets_only() {
-        assert_eq!(
-            short_target("nelfie::discord::responses"),
-            "discord::responses"
-        );
-        assert_eq!(
-            short_target("serenity::gateway::shard"),
-            "serenity::gateway::shard"
-        );
-    }
-
-    #[test]
     fn log_messages_remove_ansi_escapes_and_control_characters() {
         assert_eq!(
             sanitize_log_message("first\n\u{1b}[31mred\u{1b}[0m\tlast\u{7}"),

@@ -7,7 +7,7 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry};
 use log::{error, warn};
 use serde_json::{Value, json};
-use serenity::all::ChannelId;
+use serenity::all::{ChannelId, UserId};
 
 use crate::llm::context::{LMContext, LMContextCompaction};
 
@@ -41,6 +41,46 @@ pub struct ChatContext {
 pub struct VoiceDictionaryEntry {
     pub source: String,
     pub target: String,
+    pub registered_by: Option<UserId>,
+    pub updated_by: Option<UserId>,
+}
+
+impl VoiceDictionaryEntry {
+    pub fn from_json_value(value: &Value) -> Option<Self> {
+        let source = value
+            .get("source")
+            .or_else(|| value.get("key"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
+        let target = value
+            .get("target")
+            .or_else(|| value.get("value"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
+
+        Some(Self {
+            source,
+            target,
+            registered_by: value
+                .get("registered_by")
+                .and_then(parse_u64)
+                .map(UserId::new),
+            updated_by: value.get("updated_by").and_then(parse_u64).map(UserId::new),
+        })
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "source": self.source,
+            "target": self.target,
+            "registered_by": self.registered_by.map(|user_id| user_id.get().to_string()),
+            "updated_by": self.updated_by.map(|user_id| user_id.get().to_string()),
+        })
+    }
 }
 
 impl ChatContext {
@@ -227,6 +267,7 @@ impl ChatContexts {
         channel_id: ChannelId,
         source: String,
         target: String,
+        registered_by: Option<UserId>,
     ) -> Result<(usize, bool), String> {
         let source = source.trim().to_string();
         let target = target.trim().to_string();
@@ -250,6 +291,7 @@ impl ChatContexts {
                 .find(|item| item.source == source)
             {
                 existing.target = target;
+                existing.updated_by = registered_by;
                 (entry.voice_dictionary.len(), true)
             } else {
                 if entry.voice_dictionary.len() >= VOICE_DICTIONARY_MAX_ENTRIES {
@@ -259,9 +301,12 @@ impl ChatContexts {
                     ));
                 }
 
-                entry
-                    .voice_dictionary
-                    .push(VoiceDictionaryEntry { source, target });
+                entry.voice_dictionary.push(VoiceDictionaryEntry {
+                    source,
+                    target,
+                    registered_by,
+                    updated_by: registered_by,
+                });
                 (entry.voice_dictionary.len(), false)
             }
         };
@@ -319,6 +364,13 @@ impl ChatContexts {
             .unwrap_or_default()
     }
 
+    pub fn voice_dictionary_records(&self, channel_id: ChannelId) -> Vec<VoiceDictionaryEntry> {
+        self.contexts
+            .get(&channel_id)
+            .map(|entry| entry.voice_dictionary.clone())
+            .unwrap_or_default()
+    }
+
     pub fn voice_dictionary_count(&self, channel_id: ChannelId) -> usize {
         self.contexts
             .get(&channel_id)
@@ -366,10 +418,7 @@ impl ChatContexts {
                     "voice_dictionary": value
                         .voice_dictionary
                         .iter()
-                        .map(|item| json!({
-                            "source": item.source,
-                            "target": item.target,
-                        }))
+                        .map(VoiceDictionaryEntry::to_json_value)
                         .collect::<Vec<Value>>(),
                 }))
             })
@@ -456,25 +505,7 @@ impl ChatContexts {
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|item| {
-                            let source = item
-                                .get("source")
-                                .or_else(|| item.get("key"))
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(ToOwned::to_owned)?;
-
-                            let target = item
-                                .get("target")
-                                .or_else(|| item.get("value"))
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(ToOwned::to_owned)?;
-
-                            Some(VoiceDictionaryEntry { source, target })
-                        })
+                        .filter_map(VoiceDictionaryEntry::from_json_value)
                         .take(VOICE_DICTIONARY_MAX_ENTRIES)
                         .collect::<Vec<_>>()
                 })

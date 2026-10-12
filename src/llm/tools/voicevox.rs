@@ -2,10 +2,14 @@ use serde_json::{Value, json};
 use serenity::all::{ChannelId, GuildId, UserId};
 
 use crate::{
+    app::context::NelfieContext,
     llm::channel::{
         VOICE_DICTIONARY_MAX_ENTRIES, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX,
     },
-    llm::tool::LMTool,
+    llm::{
+        tool::{LMTool, ToolExecutionContext},
+        user::UserContextScope,
+    },
     voice::{SpeakOptions, apply_tts_dictionary, voice_catalog},
 };
 
@@ -151,6 +155,42 @@ impl VoicevoxTool {
 
         Ok(value.clamp(VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX))
     }
+
+    fn register_dictionary(
+        args: &Value,
+        ob_ctx: &NelfieContext,
+        registered_by: Option<UserId>,
+    ) -> Result<String, String> {
+        let (_guild_id, guild_id_raw) = Self::get_guild_arg(args)?;
+        let text_channel_raw = args
+            .get("text_channel_id")
+            .ok_or_else(|| "Missing or invalid 'text_channel_id' parameter".to_string())?;
+        let text_channel_id = Self::parse_id_value(text_channel_raw, "text_channel_id")?;
+        let text_channel = ChannelId::new(text_channel_id);
+        let source = Self::get_str_arg(args, "dictionary_source")?;
+        let target = Self::get_str_arg(args, "dictionary_target")?;
+
+        let (count, updated) = ob_ctx.chat_contexts.set_voice_dictionary_entry(
+            text_channel,
+            source.to_string(),
+            target.to_string(),
+            registered_by,
+        )?;
+
+        Ok(json!({
+            "status": "ok",
+            "operation": "register_dictionary",
+            "guild_id": guild_id_raw,
+            "text_channel_id": text_channel_id.to_string(),
+            "dictionary_source": source.trim(),
+            "dictionary_target": target.trim(),
+            "updated": updated,
+            "registered_by": registered_by.map(|user_id| user_id.get().to_string()),
+            "entries": count,
+            "entries_limit": VOICE_DICTIONARY_MAX_ENTRIES,
+        })
+        .to_string())
+    }
 }
 
 impl Default for VoicevoxTool {
@@ -166,7 +206,7 @@ impl LMTool for VoicevoxTool {
     }
 
     fn description(&self) -> String {
-        "Control standalone VOICEVOX CORE + Discord VC reading (no external Engine server required). You can join/leave voice channels, speak text, configure auto-read and per-text-channel parallel count, update guild and user voice settings (including other users), and list VOICEVOX style IDs.".to_string()
+        "Control standalone VOICEVOX CORE + Discord VC reading (no external Engine server required). You can join/leave voice channels, speak text, configure auto-read and per-text-channel parallel count, register dictionary entries with the invoking user's ID recorded automatically, update guild and user voice settings (including other users), and list VOICEVOX style IDs.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -444,35 +484,7 @@ impl LMTool for VoicevoxTool {
                 })
                 .to_string())
             }
-            "register_dictionary" => {
-                let (_guild_id, guild_id_raw) = Self::get_guild_arg(&args)?;
-                let text_channel_raw = args
-                    .get("text_channel_id")
-                    .ok_or_else(|| "Missing or invalid 'text_channel_id' parameter".to_string())?;
-                let text_channel_id = Self::parse_id_value(text_channel_raw, "text_channel_id")?;
-                let text_channel = ChannelId::new(text_channel_id);
-                let source = Self::get_str_arg(&args, "dictionary_source")?;
-                let target = Self::get_str_arg(&args, "dictionary_target")?;
-
-                let (count, updated) = ob_ctx.chat_contexts.set_voice_dictionary_entry(
-                    text_channel,
-                    source.to_string(),
-                    target.to_string(),
-                )?;
-
-                Ok(json!({
-                    "status": "ok",
-                    "operation": operation,
-                    "guild_id": guild_id_raw,
-                    "text_channel_id": text_channel_id.to_string(),
-                    "dictionary_source": source.trim(),
-                    "dictionary_target": target.trim(),
-                    "updated": updated,
-                    "entries": count,
-                    "entries_limit": VOICE_DICTIONARY_MAX_ENTRIES,
-                })
-                .to_string())
-            }
+            "register_dictionary" => Self::register_dictionary(&args, &ob_ctx, None),
             "set_auto_read" => {
                 let (guild_id, guild_id_raw) = Self::get_guild_arg(&args)?;
                 let enabled = Self::get_bool_arg(&args, "enabled")?;
@@ -682,6 +694,23 @@ impl LMTool for VoicevoxTool {
             other => Err(format!(
                 "Unsupported 'operation': {other}. Use one of: join_voice, leave_voice, speak_text, register_dictionary, set_auto_read, set_parallel_read, set_speaker, set_user_voice, get_user_voice, list_voice_styles, list_voice_speakers, status."
             )),
+        }
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ob_ctx: crate::app::context::NelfieContext,
+        context: ToolExecutionContext,
+    ) -> Result<String, String> {
+        if args.get("operation").and_then(Value::as_str) == Some("register_dictionary") {
+            let registered_by = match context.user_context_scope {
+                UserContextScope::User(user_id) => Some(user_id),
+                UserContextScope::GuildBot { .. } => None,
+            };
+            Self::register_dictionary(&args, &ob_ctx, registered_by)
+        } else {
+            self.execute(args, ob_ctx).await
         }
     }
 }

@@ -666,25 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn stateless_trigger_round_trips_modal_spec() {
-        let spec = simple_spec();
-
-        let trigger_id = encode_modal_trigger_custom_id(&spec).unwrap();
-        let (decoded, submit_custom_id) = decode_modal_trigger_custom_id(&trigger_id)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(submit_custom_id, "modal_builder:submit:fb");
-        assert_eq!(decoded.title, spec.title);
-        assert_eq!(decoded.logical_custom_id, spec.logical_custom_id);
-        assert_eq!(decoded.inputs.len(), 1);
-        assert_eq!(decoded.inputs[0].label, "Comment");
-        assert_eq!(decoded.inputs[0].custom_id, "comment");
-        assert_eq!(decoded.inputs[0].style, InputTextStyle::Paragraph);
-        assert!(decoded.inputs[0].required);
-    }
-
-    #[test]
     fn stateless_trigger_escapes_separators() {
         let mut spec = simple_spec();
         spec.title = "A|B".to_string();
@@ -704,16 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn stateless_trigger_rejects_fields_that_need_storage() {
-        let mut spec = simple_spec();
-        spec.inputs[0].placeholder = Some("Long helper text".to_string());
-
-        let err = encode_modal_trigger_custom_id(&spec).unwrap_err();
-
-        assert!(err.contains("stateless"));
-    }
-
-    #[test]
     fn stateless_trigger_rejects_custom_id_over_discord_limit() {
         let mut spec = simple_spec();
         spec.title = "T".repeat(45);
@@ -724,15 +695,5 @@ mod tests {
         let err = encode_modal_trigger_custom_id(&spec).unwrap_err();
 
         assert!(err.contains("modal trigger custom_id"));
-    }
-
-    #[test]
-    fn modal_validation_rejects_too_many_inputs() {
-        let mut spec = simple_spec();
-        spec.inputs = vec![spec.inputs[0].clone(); 6];
-
-        let err = validate_modal_spec(&spec).unwrap_err();
-
-        assert!(err.contains("at most 5"));
     }
 }

@@ -44,6 +44,14 @@ pub(super) fn apply_vc_dictionaries_for_ctx(ctx: &Context<'_>, text: &str) -> St
 }
 
 pub(super) async fn send_vc_embed(ctx: &Context<'_>, embed: CreateEmbed) -> Result<(), Error> {
+    send_vc_embed_with_flags(ctx, embed, InteractionResponseFlags::SUPPRESS_NOTIFICATIONS).await
+}
+
+async fn send_vc_embed_with_flags(
+    ctx: &Context<'_>,
+    embed: CreateEmbed,
+    interaction_flags: InteractionResponseFlags,
+) -> Result<(), Error> {
     match ctx {
         poise::Context::Application(app_ctx) => {
             app_ctx
@@ -53,7 +61,7 @@ pub(super) async fn send_vc_embed(ctx: &Context<'_>, embed: CreateEmbed) -> Resu
                     CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
                             .embed(embed)
-                            .flags(InteractionResponseFlags::SUPPRESS_NOTIFICATIONS),
+                            .flags(interaction_flags),
                     ),
                 )
                 .await?;

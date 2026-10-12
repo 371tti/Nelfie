@@ -24,6 +24,7 @@ pub struct Config {
     pub voicevox_open_jtalk_dict_dir: String,
     pub voicevox_vvm_dir: String,
     pub voicevox_onnxruntime_filename: String,
+    pub monitor_tcp_bind: String,
 }
 
 impl Config {
@@ -78,6 +79,8 @@ impl Config {
             .unwrap_or_else(|_| "voicevox_core/models/vvms".to_string());
         let voicevox_onnxruntime_filename =
             std::env::var("VOICEVOX_ONNXRUNTIME_FILENAME").unwrap_or_else(|_| "".to_string());
+        let monitor_tcp_bind =
+            std::env::var("MONITOR_TCP_BIND").unwrap_or_else(|_| "127.0.0.1:9791".to_string());
 
         Config {
             discord_token,
@@ -100,6 +103,7 @@ impl Config {
             voicevox_open_jtalk_dict_dir,
             voicevox_vvm_dir,
             voicevox_onnxruntime_filename,
+            monitor_tcp_bind,
         }
     }
 }

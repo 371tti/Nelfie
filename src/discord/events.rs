@@ -2,6 +2,7 @@ use std::error::Error;
 
 use log::{debug, info};
 use serenity::all::{ActivityData, FullEvent};
+use serenity::gateway::ConnectionStage;
 
 use crate::{
     app::context::NelfieContext,
@@ -27,9 +28,19 @@ pub async fn event_handler(
         }
         // 初期化完了
         FullEvent::Ready { data_about_bot } => {
+            data.monitoring.mark_gateway_ready();
             info!("Bot is connected as {}", data_about_bot.user.name);
             update_presence(ctx).await;
         }
+        FullEvent::Resume { .. } => {
+            data.monitoring.mark_gateway_ready();
+            info!("Discord gateway session resumed");
+        }
+        FullEvent::ShardStageUpdate { event } => match event.new {
+            ConnectionStage::Disconnected => data.monitoring.mark_gateway_disconnected(),
+            stage if stage.is_connecting() => data.monitoring.mark_gateway_reconnecting(),
+            _ => {}
+        },
         // あたらしいギルドに参加
         FullEvent::GuildCreate { guild, is_new } => {
             if is_new.unwrap_or(false) {
