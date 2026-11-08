@@ -8,7 +8,11 @@ use log::{debug, info, warn};
 use serenity::all::{
     CreateMessage, EditInteractionResponse, EditMessage, Message, ModalInteraction,
 };
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Instant as TokioInstant, sleep, timeout, timeout_at},
+};
 
 use crate::{
     app::context::NelfieContext,
@@ -22,7 +26,9 @@ use crate::{
         },
     },
     llm::{
-        client::GenerateResponseOptions, compaction::schedule_context_compaction, context::Role,
+        client::GenerateResponseOptions,
+        compaction::schedule_context_compaction,
+        context::{DiscordSendRecord, Role, compaction_target_tokens},
         user::UserContextScope,
     },
 };
@@ -40,6 +46,147 @@ const IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS: &str = concat!(
     "image_generation tool is enabled on the next API round using that selection. Do not ",
     "request image generation in the same round as changing the image model."
 );
+
+const RESPONSE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn abort_response_tasks(
+    typing_handle: Option<&JoinHandle<()>>,
+    state_reader: Option<&JoinHandle<()>>,
+) {
+    if let Some(typing_handle) = typing_handle {
+        typing_handle.abort();
+    }
+    if let Some(state_reader) = state_reader {
+        state_reader.abort();
+    }
+}
+
+async fn notify_response_failure(
+    ctx: &serenity::client::Context,
+    channel_id: serenity::all::ChannelId,
+    origin: &ResponseOrigin,
+    reason: &str,
+    thinking_msg: Option<&mut Message>,
+) {
+    let fallback = match reason {
+        "reasoning error" => "-# Error during reasoning".to_string(),
+        "timeout" => "-# Error timeout".to_string(),
+        "delivery error" => "-# Error during delivery".to_string(),
+        "delivery timeout" => "-# Error delivery timeout".to_string(),
+        _ => format!("-# Error {reason}"),
+    };
+    let content = origin.failure_message(reason).unwrap_or(fallback);
+
+    let result = if let Some(modal) = origin.modal_ephemeral_delivery() {
+        timeout(
+            RESPONSE_STATUS_TIMEOUT,
+            modal
+                .interaction
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content)),
+        )
+        .await
+        .map(|result| result.map(|_| ()))
+    } else if let Some(thinking_msg) = thinking_msg {
+        timeout(
+            RESPONSE_STATUS_TIMEOUT,
+            thinking_msg.edit(&ctx.http, EditMessage::new().content(content)),
+        )
+        .await
+        .map(|result| result.map(|_| ()))
+    } else {
+        timeout(
+            RESPONSE_STATUS_TIMEOUT,
+            channel_id.send_message(&ctx.http, CreateMessage::new().content(content)),
+        )
+        .await
+        .map(|result| result.map(|_| ()))
+    };
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("failed to send response failure notice: {error}"),
+        Err(_) => warn!("timed out sending response failure notice"),
+    }
+}
+
+async fn delete_thinking_message(http: &serenity::http::Http, message: Option<&Message>) {
+    let Some(message) = message else {
+        return;
+    };
+
+    match timeout(RESPONSE_STATUS_TIMEOUT, message.delete(http)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("failed to delete thinking message: {error}"),
+        Err(_) => warn!("timed out deleting thinking message"),
+    }
+}
+
+async fn deliver_response(
+    http: &serenity::http::Http,
+    origin: &ResponseOrigin,
+    channel_id: serenity::all::ChannelId,
+    text: &str,
+    footer: &str,
+    sent_via_discord_tool: Option<DiscordSendRecord>,
+    generated_images: Vec<Vec<u8>>,
+) -> Result<(), serenity::Error> {
+    if let Some(modal) = origin.modal_ephemeral_delivery() {
+        if let Some(sent) = sent_via_discord_tool {
+            if sent.private {
+                debug!(
+                    "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
+                );
+                send_modal_generated_images(http, &modal.interaction, generated_images).await?;
+                return Ok(());
+            }
+
+            debug!(
+                "Skipping final assistant send because discord-tool already posted a public modal response"
+            );
+            modal
+                .interaction
+                .edit_response(
+                    http,
+                    EditInteractionResponse::new().content(MODAL_PUBLIC_RESPONSE_MESSAGE),
+                )
+                .await
+                .ok();
+            send_generated_images(http, channel_id, generated_images).await?;
+            return Ok(());
+        }
+
+        send_modal_ephemeral_response(http, &modal.interaction, text, footer).await?;
+        send_modal_generated_images(http, &modal.interaction, generated_images).await?;
+        return Ok(());
+    }
+
+    if let Some(sent) = sent_via_discord_tool {
+        if sent.private {
+            debug!(
+                "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
+            );
+            if !generated_images.is_empty() {
+                warn!(
+                    "skipping generated image delivery because this response has no ephemeral interaction target"
+                );
+            }
+            return Ok(());
+        }
+
+        if is_same_text_loosely(&sent.content, text) {
+            debug!(
+                "Skipping final assistant send because discord-tool already posted the same text"
+            );
+            send_generated_images(http, channel_id, generated_images).await?;
+            return Ok(());
+        }
+    }
+
+    send_long_message(http, channel_id, text, footer).await?;
+    send_generated_images(http, channel_id, generated_images).await?;
+    Ok(())
+}
 
 pub(super) fn schedule_message_response(
     ctx: &serenity::client::Context,
@@ -200,9 +347,21 @@ async fn run_response_task(
             let message = origin
                 .failure_message(&reason)
                 .unwrap_or_else(|| format!("Err: {reason}"));
-            channel_id
-                .send_message(&ctx.http, CreateMessage::new().content(message))
-                .await?;
+            match timeout(
+                RESPONSE_STATUS_TIMEOUT,
+                channel_id.send_message(&ctx.http, CreateMessage::new().content(message)),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_) => warn!(
+                    "timed out sending rate limit notice: request_id={} channel={}",
+                    request_id,
+                    channel_id.get()
+                ),
+            }
             return Ok(());
         }
     };
@@ -243,55 +402,102 @@ async fn run_response_task(
                     break;
                 }
 
-                let _ = typing_channel_id.broadcast_typing(&typing_ctx.http).await;
+                let _ = timeout(
+                    RESPONSE_STATUS_TIMEOUT,
+                    typing_channel_id.broadcast_typing(&typing_ctx.http),
+                )
+                .await;
                 sleep(Duration::from_secs(5)).await;
             }
         }))
     };
 
+    let timeout_duration = Duration::from_millis(ob_context.config.timeout_millis);
+    let response_deadline = TokioInstant::now() + timeout_duration;
     let request_context = origin.current_request_context();
     let mut context = ob_context.chat_contexts.get_or_create(channel_id);
     if let Some(request_context) = request_context.as_ref() {
         context.extend(request_context);
     }
+    if origin.triggers_context_compaction() {
+        schedule_context_compaction(ob_context, channel_id);
+    }
 
     let tools = ob_context.tools.clone();
-    let channel_name = channel_id
-        .name(&ctx.http)
-        .await
-        .unwrap_or("None".to_string());
+    let mut thinking_msg = None;
+    let preparation = timeout_at(response_deadline, async {
+        let channel_name = channel_id
+            .name(&ctx.http)
+            .await
+            .unwrap_or_else(|_| "None".to_string());
 
-    let mut system_prompt = format!(
-        "{}\n current guild_id: {}, current channel_id: {}, channel_name: {}",
-        ob_context.chat_contexts.get_system_prompt(channel_id),
-        guild_id
-            .map(|id| id.get().to_string())
-            .unwrap_or_else(|| "None".to_string()),
-        channel_id,
-        channel_name,
-    );
-    if let Some(note) = origin.system_note() {
-        system_prompt.push('\n');
-        system_prompt.push_str(&note);
+        let mut system_prompt = format!(
+            "{}\n current guild_id: {}, current channel_id: {}, channel_name: {}",
+            ob_context.chat_contexts.get_system_prompt(channel_id),
+            guild_id
+                .map(|id| id.get().to_string())
+                .unwrap_or_else(|| "None".to_string()),
+            channel_id,
+            channel_name,
+        );
+        if let Some(note) = origin.system_note() {
+            system_prompt.push('\n');
+            system_prompt.push_str(&note);
+        }
+        system_prompt.push_str(IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS);
+
+        context.add_text(system_prompt, Role::System);
+        let request_token_limit = compaction_target_tokens(
+            ob_context.config.context_compaction_token_limit,
+        );
+        let (dropped_items, estimated_tokens) =
+            context.trim_to_recent_token_limit(request_token_limit);
+        if dropped_items > 0 {
+            info!(
+                "bounded response context: request_id={} channel={} dropped_items={} estimated_tokens={} limit={}",
+                request_id,
+                channel_id.get(),
+                dropped_items,
+                estimated_tokens,
+                request_token_limit
+            );
+        }
+        refresh_discord_image_urls_for_api(ctx, &mut context).await;
+
+        if origin.uses_public_progress() {
+            thinking_msg = Some(
+                channel_id
+                    .send_message(
+                        &ctx.http,
+                        CreateMessage::new().content(origin.thinking_label()),
+                    )
+                    .await?,
+            );
+        }
+
+        Ok::<(), serenity::Error>(())
+    })
+    .await;
+    match preparation {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            abort_response_tasks(typing_handle.as_ref(), None);
+            return Err(Box::new(error));
+        }
+        Err(_) => {
+            abort_response_tasks(typing_handle.as_ref(), None);
+            warn!(
+                "response timed out during preparation: request_id={} source={} channel={} timeout_ms={}",
+                request_id,
+                source,
+                channel_id.get(),
+                ob_context.config.timeout_millis
+            );
+            notify_response_failure(ctx, channel_id, &origin, "timeout", thinking_msg.as_mut())
+                .await;
+            return Ok(());
+        }
     }
-    system_prompt.push_str(IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS);
-
-    refresh_discord_image_urls_for_api(ctx, &mut context).await;
-
-    context.add_text(system_prompt, Role::System);
-
-    let mut thinking_msg = if !origin.uses_public_progress() {
-        None
-    } else {
-        Some(
-            channel_id
-                .send_message(
-                    &ctx.http,
-                    CreateMessage::new().content(origin.thinking_label()),
-                )
-                .await?,
-        )
-    };
 
     let (state_tx, state_rx) = mpsc::channel::<String>(100);
     let (rate_usage_tx, mut rate_usage_rx) = mpsc::unbounded_channel::<u64>();
@@ -322,19 +528,20 @@ async fn run_response_task(
                     continue;
                 }
 
-                let _ = state_channel
-                    .edit_message(
+                let _ = timeout(
+                    RESPONSE_STATUS_TIMEOUT,
+                    state_channel.edit_message(
                         &state_http,
                         state_msg_id,
                         EditMessage::new().content(format!("-# {}", state)),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 last_edit = Instant::now();
             }
         })
     });
 
-    let timeout_duration = Duration::from_millis(ob_context.config.timeout_millis);
     let context_cache_key = format!("nelfie-context-{}", channel_id.get());
     let generate_response = ob_context.lm_client.generate_response(
         ob_context.clone(),
@@ -350,7 +557,7 @@ async fn run_response_task(
             rate_usage_sender: rate_usage_tx,
         },
     );
-    let result = match tokio::time::timeout(timeout_duration, async {
+    let result = match timeout_at(response_deadline, async {
         if let Some(ephemeral_context) = origin.ephemeral_interaction_context() {
             scope_ephemeral_interaction(ephemeral_context, generate_response).await
         } else {
@@ -361,53 +568,20 @@ async fn run_response_task(
     {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
-            let message = origin
-                .failure_message("reasoning error")
-                .unwrap_or_else(|| "-# Error during reasoning".to_string());
-            if let Some(modal) = origin.modal_ephemeral_delivery() {
-                modal
-                    .interaction
-                    .edit_response(&ctx.http, EditInteractionResponse::new().content(message))
-                    .await
-                    .ok();
-            } else if let Some(thinking_msg) = thinking_msg.as_mut() {
-                thinking_msg
-                    .edit(&ctx.http, EditMessage::new().content(message))
-                    .await
-                    .ok();
-            }
-            if let Some(typing_handle) = typing_handle.as_ref() {
-                typing_handle.abort();
-            }
-            if let Some(state_reader) = state_reader.as_ref() {
-                state_reader.abort();
-            }
-            let _ = rate_usage_task.await;
+            abort_response_tasks(typing_handle.as_ref(), state_reader.as_ref());
+            notify_response_failure(
+                ctx,
+                channel_id,
+                &origin,
+                "reasoning error",
+                thinking_msg.as_mut(),
+            )
+            .await;
+            drop(rate_usage_task);
             return Err(e);
         }
         Err(_) => {
-            let message = origin
-                .failure_message("timeout")
-                .unwrap_or_else(|| "-# Error timeout".to_string());
-            if let Some(modal) = origin.modal_ephemeral_delivery() {
-                modal
-                    .interaction
-                    .edit_response(&ctx.http, EditInteractionResponse::new().content(message))
-                    .await
-                    .ok();
-            } else if let Some(thinking_msg) = thinking_msg.as_mut() {
-                thinking_msg
-                    .edit(&ctx.http, EditMessage::new().content(message))
-                    .await
-                    .ok();
-            }
-            if let Some(typing_handle) = typing_handle.as_ref() {
-                typing_handle.abort();
-            }
-            if let Some(state_reader) = state_reader.as_ref() {
-                state_reader.abort();
-            }
-            let _ = rate_usage_task.await;
+            abort_response_tasks(typing_handle.as_ref(), state_reader.as_ref());
             warn!(
                 "response timed out: request_id={} source={} channel={} timeout_ms={}",
                 request_id,
@@ -415,6 +589,9 @@ async fn run_response_task(
                 channel_id.get(),
                 ob_context.config.timeout_millis
             );
+            notify_response_failure(ctx, channel_id, &origin, "timeout", thinking_msg.as_mut())
+                .await;
+            drop(rate_usage_task);
             return Ok(());
         }
     };
@@ -430,9 +607,8 @@ async fn run_response_task(
         .map(|active| active.request_id == request_id)
         .unwrap_or(false);
     if !still_current {
-        if let Some(typing_handle) = typing_handle.as_ref() {
-            typing_handle.abort();
-        }
+        abort_response_tasks(typing_handle.as_ref(), state_reader.as_ref());
+        delete_thinking_message(&ctx.http, thinking_msg.as_ref()).await;
         return Ok(());
     }
 
@@ -441,9 +617,6 @@ async fn run_response_task(
     let result = result.context;
 
     ob_context.chat_contexts.marge(channel_id, &result);
-    if origin.triggers_context_compaction() {
-        schedule_context_compaction(ob_context, channel_id);
-    }
 
     let elapsed = start.elapsed().as_millis();
     let text = result.get_result();
@@ -478,75 +651,64 @@ async fn run_response_task(
     );
     info!("response output: request_id={} text={}", request_id, text);
 
-    if let Some(typing_handle) = typing_handle.as_ref() {
-        typing_handle.abort();
-    }
-
-    if let Some(thinking_msg) = thinking_msg.as_ref()
-        && let Err(e) = thinking_msg.delete(&ctx.http).await
-    {
-        warn!("failed to delete thinking message: {}", e);
-    }
+    abort_response_tasks(typing_handle.as_ref(), state_reader.as_ref());
 
     let footer = format!("-# Reasoning done in {}ms, model: {}", elapsed, final_model);
-
-    if let Some(modal) = origin.modal_ephemeral_delivery() {
-        if let Some(sent) = sent_via_discord_tool {
-            if sent.private {
-                debug!(
-                    "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
-                );
-                send_modal_generated_images(&ctx.http, &modal.interaction, generated_images)
-                    .await?;
-                return Ok(());
-            }
-
-            debug!(
-                "Skipping final assistant send because discord-tool already posted a public modal response"
-            );
-            modal
-                .interaction
-                .edit_response(
-                    &ctx.http,
-                    EditInteractionResponse::new().content(MODAL_PUBLIC_RESPONSE_MESSAGE),
-                )
-                .await
-                .ok();
-            send_generated_images(&ctx.http, channel_id, generated_images).await?;
-            return Ok(());
+    match timeout(
+        RESPONSE_DELIVERY_TIMEOUT,
+        deliver_response(
+            &ctx.http,
+            &origin,
+            channel_id,
+            &text,
+            &footer,
+            sent_via_discord_tool,
+            generated_images,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            delete_thinking_message(&ctx.http, thinking_msg.as_ref()).await;
+            Ok(())
         }
-
-        send_modal_ephemeral_response(&ctx.http, &modal.interaction, &text, &footer).await?;
-        send_modal_generated_images(&ctx.http, &modal.interaction, generated_images).await?;
-        return Ok(());
+        Ok(Err(error)) => {
+            warn!(
+                "response delivery failed: request_id={} source={} channel={} error={}",
+                request_id,
+                source,
+                channel_id.get(),
+                error
+            );
+            notify_response_failure(
+                ctx,
+                channel_id,
+                &origin,
+                "delivery error",
+                thinking_msg.as_mut(),
+            )
+            .await;
+            Err(Box::new(error))
+        }
+        Err(_) => {
+            warn!(
+                "response delivery timed out: request_id={} source={} channel={} timeout_ms={}",
+                request_id,
+                source,
+                channel_id.get(),
+                RESPONSE_DELIVERY_TIMEOUT.as_millis()
+            );
+            notify_response_failure(
+                ctx,
+                channel_id,
+                &origin,
+                "delivery timeout",
+                thinking_msg.as_mut(),
+            )
+            .await;
+            Ok(())
+        }
     }
-
-    if let Some(sent) = sent_via_discord_tool {
-        if sent.private {
-            debug!(
-                "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
-            );
-            if !generated_images.is_empty() {
-                warn!(
-                    "skipping generated image delivery because this response has no ephemeral interaction target"
-                );
-            }
-            return Ok(());
-        }
-
-        if is_same_text_loosely(&sent.content, &text) {
-            debug!(
-                "Skipping final assistant send because discord-tool already posted the same text"
-            );
-            send_generated_images(&ctx.http, channel_id, generated_images).await?;
-            return Ok(());
-        }
-    }
-
-    send_long_message(&ctx.http, channel_id, &text, &footer).await?;
-    send_generated_images(&ctx.http, channel_id, generated_images).await?;
-
-    Ok(())
 }
 
 fn is_same_text_loosely(a: &str, b: &str) -> bool {

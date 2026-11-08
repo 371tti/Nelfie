@@ -5,8 +5,21 @@ use async_openai::types::responses::{
     InputImageContent, InputItem, InputMessage, InputParam, InputRole, Item, MessageItem,
     MessageType, OutputMessageContent,
 };
+use tiktoken_rs::o200k_base_singleton;
 
 pub use async_openai::types::responses::Role;
+
+pub const SUMMARY_INPUT_MAX_BYTES: usize = 32 * 1024;
+const COMPACTION_RETAINED_TURNS: usize = 2;
+const COMPACTION_TARGET_NUMERATOR: u32 = 3;
+const COMPACTION_TARGET_DENOMINATOR: u32 = 4;
+// Reserve headroom for the model-side image expansion; this is not an exact image token count.
+const ESTIMATED_IMAGE_TOKENS: usize = 1_024;
+
+pub fn compaction_target_tokens(trigger_tokens: u32) -> usize {
+    (trigger_tokens as u64 * COMPACTION_TARGET_NUMERATOR as u64
+        / COMPACTION_TARGET_DENOMINATOR as u64) as usize
+}
 
 #[derive(Clone, Debug)]
 pub struct DiscordSendRecord {
@@ -32,12 +45,14 @@ pub struct LMContext {
     pub discord_image_sources: Vec<DiscordImageSource>,
     last_response_total_tokens: Option<u32>,
     last_response_cache_usage: Option<PromptCacheUsage>,
+    response_completed: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct LMContextCompaction {
     source_items: Vec<InputItem>,
-    summary_context: LMContext,
+    summary_contexts: Vec<LMContext>,
+    oversized_first_turn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +77,7 @@ impl LMContext {
             discord_image_sources: Vec::new(),
             last_response_total_tokens: None,
             last_response_cache_usage: None,
+            response_completed: false,
         }
     }
 
@@ -70,6 +86,7 @@ impl LMContext {
         self.discord_image_sources.clear();
         self.last_response_total_tokens = None;
         self.last_response_cache_usage = None;
+        self.response_completed = false;
     }
 
     pub fn generate_context(&self) -> InputParam {
@@ -88,6 +105,7 @@ impl LMContext {
             discord_image_sources: Vec::new(),
             last_response_total_tokens: self.last_response_total_tokens,
             last_response_cache_usage: self.last_response_cache_usage,
+            response_completed: false,
         };
         sanitized.sanitize_tool_history();
         InputParam::Items(sanitized.buf.into())
@@ -102,18 +120,13 @@ impl LMContext {
         }
         self.discord_image_sources
             .extend(other.discord_image_sources.iter().cloned());
-        if other.last_response_total_tokens.is_some() {
+        if other.response_completed {
             self.last_response_total_tokens = other.last_response_total_tokens;
-        }
-        if other.last_response_cache_usage.is_some() {
             self.last_response_cache_usage = other.last_response_cache_usage;
         }
+        self.response_completed = false;
         self.sanitize_tool_history();
         self.prune_discord_image_sources_to_present_urls();
-    }
-
-    pub fn record_response_total_tokens(&mut self, total_tokens: u32) {
-        self.last_response_total_tokens = Some(total_tokens);
     }
 
     pub fn record_response_usage(
@@ -137,59 +150,165 @@ impl LMContext {
         self.last_response_total_tokens
     }
 
+    pub fn mark_response_completed(&mut self) {
+        self.response_completed = true;
+    }
+
+    pub fn serialized_input_bytes(&self) -> usize {
+        context_input_bytes(self)
+    }
+
+    pub fn estimated_input_tokens(&self) -> usize {
+        self.buf
+            .iter()
+            .map(estimated_item_tokens)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    pub fn trim_to_recent_token_limit(&mut self, token_limit: usize) -> (usize, usize) {
+        self.sanitize_tool_history();
+        let item_token_estimates = self
+            .buf
+            .iter()
+            .map(estimated_item_tokens)
+            .collect::<Vec<_>>();
+        let estimated_total = item_token_estimates
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add);
+        if estimated_total <= token_limit {
+            return (0, estimated_total);
+        }
+
+        let item_count = self.buf.len();
+        let turns = history_turn_ranges(&self.buf);
+        let mut keep = vec![false; item_count];
+        let mut retained_tokens = 0usize;
+
+        for (index, item) in self.buf.iter().enumerate() {
+            if is_pinned_instruction(item) {
+                keep[index] = true;
+                retained_tokens = retained_tokens.saturating_add(item_token_estimates[index]);
+            }
+        }
+
+        let mut retained_turns = 0usize;
+        for &(start, end) in turns.iter().rev() {
+            let turn_tokens = (start..end)
+                .filter(|index| !keep[*index])
+                .map(|index| item_token_estimates[index])
+                .fold(0usize, usize::saturating_add);
+            if retained_turns > 0 && retained_tokens.saturating_add(turn_tokens) > token_limit {
+                break;
+            }
+
+            for item_index in start..end {
+                keep[item_index] = true;
+            }
+            retained_tokens = retained_tokens.saturating_add(turn_tokens);
+            retained_turns += 1;
+        }
+
+        let before = self.buf.len();
+        self.buf = std::mem::take(&mut self.buf)
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(item, keep)| keep.then_some(item))
+            .collect();
+        self.prune_discord_image_sources_to_present_urls();
+        (before.saturating_sub(self.buf.len()), retained_tokens)
+    }
+
     pub fn response_cache_usage(&self) -> Option<PromptCacheUsage> {
         self.last_response_cache_usage
     }
 
-    pub fn plan_compaction(&self, token_limit: u32) -> Option<LMContextCompaction> {
-        if token_limit == 0 || self.last_response_total_tokens? < token_limit {
+    pub fn plan_compaction(
+        &self,
+        trigger_token_limit: u32,
+        target_token_limit: usize,
+    ) -> Option<LMContextCompaction> {
+        let estimated_tokens = self.estimated_input_tokens();
+        if trigger_token_limit == 0 || estimated_tokens < trigger_token_limit as usize {
+            return None;
+        }
+
+        self.plan_compaction_batch_if_needed(target_token_limit, estimated_tokens)
+    }
+
+    pub fn plan_compaction_batch(&self, target_token_limit: usize) -> Option<LMContextCompaction> {
+        let estimated_tokens = self.estimated_input_tokens();
+        self.plan_compaction_batch_if_needed(target_token_limit, estimated_tokens)
+    }
+
+    fn plan_compaction_batch_if_needed(
+        &self,
+        target_token_limit: usize,
+        estimated_tokens: usize,
+    ) -> Option<LMContextCompaction> {
+        if estimated_tokens <= target_token_limit {
             return None;
         }
 
         let mut sanitized = self.clone();
         sanitized.sanitize_tool_history();
         let turns = history_turn_ranges(&sanitized.buf);
-        if turns.len() < 2 {
+        if turns.len() <= COMPACTION_RETAINED_TURNS {
             return None;
         }
 
-        let total_weight = sanitized
-            .buf
-            .iter()
-            .map(estimated_item_weight)
-            .sum::<usize>();
-        let target_weight = total_weight / 2;
-        let mut cumulative_weight = 0usize;
-        let mut best_boundary = None::<(usize, usize)>;
+        let eligible_turns = turns.len() - COMPACTION_RETAINED_TURNS;
+        let mut source_end = 0usize;
+        let mut source_items = Vec::new();
+        let mut source_weight = 2usize;
+        let mut summary_contexts = Vec::new();
+        let mut oversized_first_turn = false;
+        let safe_source_bytes = SUMMARY_INPUT_MAX_BYTES.saturating_sub(1_024);
 
-        for &(start, end) in turns.iter().take(turns.len() - 1) {
-            cumulative_weight += sanitized
-                .buf
-                .range(start..end)
-                .map(estimated_item_weight)
-                .sum::<usize>();
-            let distance = cumulative_weight.abs_diff(target_weight);
-            if best_boundary.is_none_or(|(_, best_distance)| distance < best_distance) {
-                best_boundary = Some((end, distance));
+        for &(start, end) in turns.iter().take(eligible_turns) {
+            let turn_items = sanitized.buf.range(start..end).cloned().collect::<Vec<_>>();
+            let turn_weight = turn_items
+                .iter()
+                .map(serialized_item_bytes)
+                .map(|weight| weight.saturating_add(1))
+                .fold(0usize, usize::saturating_add);
+            let candidate_weight = source_weight.saturating_add(turn_weight);
+
+            if candidate_weight <= safe_source_bytes {
+                source_weight = candidate_weight;
+                source_items.extend(turn_items);
+                source_end = end;
+                continue;
             }
+
+            if source_end == 0 {
+                source_end = end;
+                source_items.extend(turn_items);
+                summary_contexts =
+                    chunk_oversized_turn_context(&source_items, SUMMARY_INPUT_MAX_BYTES);
+                oversized_first_turn = true;
+            }
+            break;
         }
 
-        let (boundary, _) = best_boundary?;
-        let source_items = sanitized
-            .buf
-            .iter()
-            .take(boundary)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut summary_context = LMContext::new();
-        summary_context.buf = source_items.iter().cloned().collect();
-        for item in &mut summary_context.buf {
-            redact_images_for_compaction(item);
+        if source_end == 0 {
+            return None;
+        }
+        if summary_contexts.is_empty() {
+            let summary_context = summary_context_for_items(&source_items);
+            if context_input_bytes(&summary_context) <= SUMMARY_INPUT_MAX_BYTES {
+                summary_contexts.push(summary_context);
+            } else {
+                summary_contexts =
+                    chunk_oversized_turn_context(&source_items, SUMMARY_INPUT_MAX_BYTES);
+                oversized_first_turn = true;
+            }
         }
 
         Some(LMContextCompaction {
             source_items,
-            summary_context,
+            summary_contexts,
+            oversized_first_turn,
         })
     }
 
@@ -210,17 +329,15 @@ impl LMContext {
         }
 
         self.buf.drain(..compaction.source_items.len());
-        self.buf.push_front(text_message_item(
-            format!(
-                "Summary of earlier conversation context. Treat this as background memory, not \
-                 as a new user request:\n{summary}"
-            ),
-            Role::Developer,
-        ));
-        self.last_response_total_tokens = None;
-        self.last_response_cache_usage = None;
+        self.buf.push_front(compaction_summary_item(summary));
         self.prune_discord_image_sources_to_present_urls();
         true
+    }
+
+    pub fn reset_compaction_measurements(&mut self) {
+        self.last_response_total_tokens = None;
+        self.last_response_cache_usage = None;
+        self.response_completed = false;
     }
 
     fn sanitize_tool_history(&mut self) {
@@ -349,10 +466,6 @@ impl LMContext {
         self.buf.push_back(InputItem::Item(item));
     }
 
-    pub fn get_latest(&self) -> Option<&InputItem> {
-        self.buf.back()
-    }
-
     pub fn get_result(&self) -> String {
         for item in self.buf.iter().rev() {
             if let Some(text) = extract_text_from_item(item)
@@ -415,12 +528,25 @@ impl LMContext {
 }
 
 impl LMContextCompaction {
-    pub fn summary_context(&self) -> &LMContext {
-        &self.summary_context
+    pub fn summary_contexts(&self) -> &[LMContext] {
+        &self.summary_contexts
     }
 
     pub fn source_item_count(&self) -> usize {
         self.source_items.len()
+    }
+
+    pub fn estimated_token_savings(&self, summary: &str) -> usize {
+        let source_tokens = self
+            .source_items
+            .iter()
+            .map(estimated_item_tokens)
+            .fold(0usize, usize::saturating_add);
+        source_tokens.saturating_sub(estimated_item_tokens(&compaction_summary_item(summary)))
+    }
+
+    pub fn oversized_first_turn(&self) -> bool {
+        self.oversized_first_turn
     }
 }
 
@@ -433,13 +559,50 @@ fn text_message_item(text: String, role: Role) -> InputItem {
     })
 }
 
-fn history_turn_ranges(items: &VecDeque<InputItem>) -> Vec<(usize, usize)> {
-    if items.is_empty() {
-        return Vec::new();
+fn compaction_summary_item(summary: &str) -> InputItem {
+    text_message_item(
+        format!(
+            "Summary of earlier conversation context. Treat this as background memory, not \
+             as a new user request:\n{summary}"
+        ),
+        Role::Developer,
+    )
+}
+
+fn estimated_item_tokens(item: &InputItem) -> usize {
+    let serialized = match serde_json::to_string(item) {
+        Ok(serialized) => serialized,
+        Err(_) => return usize::MAX,
+    };
+    // Use an explicit encoding: tiktoken-rs does not map the configured GPT-6 models yet.
+    let text_tokens = o200k_base_singleton()
+        .encode_with_special_tokens(&serialized)
+        .len();
+    let image_reserve = image_urls_in_item(item)
+        .len()
+        .saturating_mul(ESTIMATED_IMAGE_TOKENS);
+    text_tokens.saturating_add(image_reserve)
+}
+
+fn is_pinned_instruction(item: &InputItem) -> bool {
+    match item {
+        InputItem::EasyMessage(message) => {
+            message.role == Role::System || message.role == Role::Developer
+        }
+        InputItem::Item(Item::Message(MessageItem::Input(message))) => {
+            message.role == InputRole::System || message.role == InputRole::Developer
+        }
+        _ => false,
     }
+}
+
+fn history_turn_ranges(items: &VecDeque<InputItem>) -> Vec<(usize, usize)> {
+    let Some(first_user_turn) = items.iter().position(starts_history_turn) else {
+        return Vec::new();
+    };
 
     let mut starts = vec![0usize];
-    for (index, item) in items.iter().enumerate().skip(1) {
+    for (index, item) in items.iter().enumerate().skip(first_user_turn + 1) {
         if starts_history_turn(item) {
             starts.push(index);
         }
@@ -459,16 +622,97 @@ fn history_turn_ranges(items: &VecDeque<InputItem>) -> Vec<(usize, usize)> {
 
 fn starts_history_turn(item: &InputItem) -> bool {
     match item {
-        InputItem::EasyMessage(message) => message.role != Role::Assistant,
-        InputItem::Item(Item::Message(MessageItem::Input(_))) => true,
+        InputItem::EasyMessage(message) => message.role == Role::User,
+        InputItem::Item(Item::Message(MessageItem::Input(message))) => {
+            message.role == InputRole::User
+        }
         _ => false,
     }
 }
 
-fn estimated_item_weight(item: &InputItem) -> usize {
+fn summary_context_for_items(items: &[InputItem]) -> LMContext {
+    let mut summary_context = LMContext::new();
+    summary_context.buf = items.iter().cloned().collect();
+    for item in &mut summary_context.buf {
+        redact_images_for_compaction(item);
+    }
+    summary_context.sanitize_tool_history();
+    summary_context
+}
+
+fn chunk_oversized_turn_context(items: &[InputItem], max_bytes: usize) -> Vec<LMContext> {
+    let redacted_items = summary_context_for_items(items).buf;
+    let serialized = serde_json::to_string(&redacted_items).unwrap_or_default();
+    let mut chunk_bytes = (max_bytes / 3).max(1);
+
+    loop {
+        let text_chunks = split_utf8_chunks(&serialized, chunk_bytes);
+        let total_chunks = text_chunks.len();
+        let contexts = text_chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                let mut context = LMContext::new();
+                context.add_text(
+                    format!(
+                        "Ordered segment {} of {} from the earliest historical turn. The body \
+                         continues across segments and boundaries may occur inside serialized \
+                         JSON. Use this segment only as source material; combine facts in segment \
+                         order.\n\n{}",
+                        index + 1,
+                        total_chunks,
+                        chunk
+                    ),
+                    Role::User,
+                );
+                context
+            })
+            .collect::<Vec<_>>();
+
+        if contexts
+            .iter()
+            .all(|context| context_input_bytes(context) <= max_bytes)
+            || chunk_bytes == 1
+        {
+            return contexts;
+        }
+        chunk_bytes = (chunk_bytes / 2).max(1);
+    }
+}
+
+pub(crate) fn split_utf8_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut end = 0usize;
+
+    for (index, character) in text.char_indices() {
+        let next_end = index + character.len_utf8();
+        if next_end - start > max_bytes && end > start {
+            chunks.push(&text[start..end]);
+            start = index;
+        }
+        end = next_end;
+    }
+
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    if chunks.is_empty() {
+        chunks.push("");
+    }
+    chunks
+}
+
+fn context_input_bytes(context: &LMContext) -> usize {
+    serde_json::to_vec(&context.generate_context())
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn serialized_item_bytes(item: &InputItem) -> usize {
     serde_json::to_vec(item)
-        .map(|serialized| serialized.len().max(1))
-        .unwrap_or(1)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
 }
 
 fn redact_images_for_compaction(item: &mut InputItem) {
@@ -774,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_uses_response_tokens_and_keeps_tool_pairs_atomic() {
+    fn compaction_uses_local_token_estimate_and_keeps_tool_pairs_atomic() {
         let mut history = LMContext::new();
         history.add_text("old request".to_string(), Role::User);
         history.buf.push_back(function_call_item("call_1", None));
@@ -782,11 +1026,14 @@ mod tests {
         history.add_text("middle request".to_string(), Role::User);
         history.add_text("recent request".to_string(), Role::User);
 
-        history.record_response_total_tokens(999);
-        assert!(history.plan_compaction(1_000).is_none());
+        let estimate = history.estimated_input_tokens() as u32;
+        assert!(
+            history
+                .plan_compaction(estimate.saturating_add(1), 0)
+                .is_none()
+        );
 
-        history.record_response_total_tokens(1_000);
-        let compaction = history.plan_compaction(1_000).unwrap();
+        let compaction = history.plan_compaction(estimate, 0).unwrap();
         let has_call = compaction
             .source_items
             .iter()
@@ -804,8 +1051,8 @@ mod tests {
         for message in ["old one", "old two", "recent one", "recent two"] {
             history.add_text(message.to_string(), Role::User);
         }
-        history.record_response_total_tokens(10_000);
-        let compaction = history.plan_compaction(10_000).unwrap();
+        history.record_response_usage(10_000, 10_000, 0);
+        let compaction = history.plan_compaction(1, 0).unwrap();
 
         history.add_text("arrived while summarizing".to_string(), Role::User);
         assert!(history.apply_compaction(&compaction, "important earlier details"));
@@ -816,7 +1063,7 @@ mod tests {
                 .unwrap()
                 .contains("important earlier details")
         );
-        assert_eq!(history.response_total_tokens(), None);
+        assert_eq!(history.response_total_tokens(), Some(10_000));
     }
 
     #[test]
@@ -825,8 +1072,8 @@ mod tests {
         for message in ["old one", "old two", "recent"] {
             history.add_text(message.to_string(), Role::User);
         }
-        history.record_response_total_tokens(10_000);
-        let compaction = history.plan_compaction(10_000).unwrap();
+        history.record_response_usage(10_000, 10_000, 0);
+        let compaction = history.plan_compaction(1, 0).unwrap();
 
         history.clear();
         history.add_text("new conversation".to_string(), Role::User);
@@ -840,12 +1087,13 @@ mod tests {
         let image_url = "https://cdn.discordapp.com/attachments/1/2/image.png?ex=ffff";
         let mut history = LMContext::new();
         history.add_user_text_with_images("old image".to_string(), vec![image_url.to_string()]);
+        history.add_text("middle request".to_string(), Role::User);
         history.add_text("recent request".to_string(), Role::User);
-        history.record_response_total_tokens(10_000);
+        history.record_response_usage(10_000, 10_000, 0);
 
-        let compaction = history.plan_compaction(10_000).unwrap();
+        let compaction = history.plan_compaction(1, 0).unwrap();
         let serialized =
-            serde_json::to_string(&compaction.summary_context().generate_context()).unwrap();
+            serde_json::to_string(&compaction.summary_contexts()[0].generate_context()).unwrap();
 
         assert!(!serialized.contains(image_url));
         assert!(serialized.contains("image attachment(s) omitted"));

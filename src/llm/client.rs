@@ -47,6 +47,12 @@ pub struct GenerateResponseResult {
     pub final_model: Models,
 }
 
+pub struct ContextSummaryResult {
+    pub text: String,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+}
+
 const CONTEXT_SUMMARY_INSTRUCTIONS: &str = "Summarize the supplied earlier conversation history \
     as durable background memory for a later assistant response. Preserve user goals, constraints, \
     decisions, important facts, tool results, and unresolved work. Keep identities and visibility \
@@ -438,6 +444,7 @@ impl LMClient {
             }
         }
 
+        delta_context.mark_response_completed();
         Ok(GenerateResponseResult {
             context: delta_context,
             generated_images,
@@ -449,7 +456,13 @@ impl LMClient {
         &self,
         context: &LMContext,
         max_output_tokens: u32,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ContextSummaryResult, Box<dyn std::error::Error + Send + Sync>> {
+        if context.serialized_input_bytes() > crate::llm::context::SUMMARY_INPUT_MAX_BYTES {
+            return Err(Box::new(io::Error::other(
+                "context summary input exceeds the configured byte limit",
+            )));
+        }
+
         let parameters = Models::CONTEXT_SUMMARY_MODEL.to_parameter();
         let mut request_builder = CreateResponseArgs::default();
         request_builder
@@ -471,12 +484,15 @@ impl LMClient {
                 response.status
             ))));
         }
-        if let Some(usage) = &response.usage {
+        let (input_tokens, output_tokens) = if let Some(usage) = &response.usage {
             debug!(
                 "Context summary token usage: input={}, output={}, total={}",
                 usage.input_tokens, usage.output_tokens, usage.total_tokens
             );
-        }
+            (Some(usage.input_tokens), Some(usage.output_tokens))
+        } else {
+            (None, None)
+        };
 
         let summary = response
             .output
@@ -498,7 +514,11 @@ impl LMClient {
                 "context summarization returned no text",
             )));
         }
-        Ok(summary)
+        Ok(ContextSummaryResult {
+            text: summary,
+            input_tokens,
+            output_tokens,
+        })
     }
 }
 

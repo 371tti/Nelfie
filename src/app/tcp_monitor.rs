@@ -77,21 +77,24 @@ impl TcpMonitorServer {
 }
 
 async fn handle_client(context: &NelfieContext, mut stream: TcpStream) -> io::Result<()> {
-    let request = match timeout(REQUEST_TIMEOUT, read_request(&mut stream)).await {
-        Ok(result) => result?,
-        Err(_) => return Ok(()),
-    };
+    match timeout(REQUEST_TIMEOUT, async {
+        let request = read_request(&mut stream).await?;
+        let response = match request {
+            MonitorRequest::Metrics => render_metrics(context).await,
+            MonitorRequest::Invalid => {
+                "status.code 2\nmonitor.command.unit boolean\nmonitor.command.valid 0\n\n".into()
+            }
+            MonitorRequest::Empty => return Ok(()),
+        };
 
-    let response = match request {
-        MonitorRequest::Metrics => render_metrics(context).await,
-        MonitorRequest::Invalid => {
-            "status.code 2\nmonitor.command.unit boolean\nmonitor.command.valid 0\n\n".into()
-        }
-        MonitorRequest::Empty => return Ok(()),
-    };
-
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Ok(()),
+    }
 }
 
 enum MonitorRequest {

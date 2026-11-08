@@ -10,6 +10,40 @@ pub mod modal_builder;
 pub mod model_control;
 pub mod voicevox;
 
+pub(super) fn get_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Result<&'a str, String> {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("Missing or invalid '{key}' parameter"))
+}
+
+pub(super) fn get_non_empty_trimmed_str_arg<'a>(
+    args: &'a serde_json::Value,
+    key: &'a str,
+) -> Result<&'a str, String> {
+    let value = get_str_arg(args, key)?.trim();
+    if value.is_empty() {
+        Err(format!("Missing or invalid '{key}' parameter"))
+    } else {
+        Ok(value)
+    }
+}
+
+pub(super) fn get_opt_str_arg<'a>(
+    args: &'a serde_json::Value,
+    key: &'a str,
+) -> Option<&'a str> {
+    args.get(key).and_then(serde_json::Value::as_str)
+}
+
+pub(super) fn get_opt_non_empty_trimmed_str_arg<'a>(
+    args: &'a serde_json::Value,
+    key: &'a str,
+) -> Option<&'a str> {
+    get_opt_str_arg(args, key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 pub fn registry() -> HashMap<String, Box<dyn LMTool>> {
     let tools: Vec<Box<dyn LMTool>> = vec![
         Box::new(get_time::GetTime::new()),

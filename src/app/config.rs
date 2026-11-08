@@ -18,9 +18,7 @@ pub struct Config {
     pub voicevox_default_speaker: u32,
     pub voicevox_core_acceleration: String,
     pub voicevox_core_cpu_threads: u16,
-    pub voicevox_core_load_all_models: bool,
     pub voicevox_output_sampling_rate: u32,
-    pub voicevox_preload_on_startup: bool,
     pub voicevox_open_jtalk_dict_dir: String,
     pub voicevox_vvm_dir: String,
     pub voicevox_onnxruntime_filename: String,
@@ -33,6 +31,17 @@ impl Config {
         let openai_api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
         let system_prompt =
             std::env::var("SYSTEM_PROMPT").unwrap_or_else(|_| DEFAULT_SYSTEM_PROMPT.to_owned());
+        let admin_users = std::env::var("ADMIN_USER_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())
+            .map(|user_id| {
+                user_id
+                    .parse::<u64>()
+                    .expect("ADMIN_USER_IDS must be comma-separated Discord user IDs")
+            })
+            .collect();
         let context_compaction_token_limit = std::env::var("CONTEXT_COMPACTION_TOKEN_LIMIT")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -53,26 +62,12 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(0);
-        let voicevox_core_load_all_models = std::env::var("VOICEVOX_CORE_LOAD_ALL_MODELS")
-            .ok()
-            .map(|v| {
-                let normalized = v.trim().to_ascii_lowercase();
-                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false);
         // 24000 の倍数で、8000以上96000以下の値じゃないと怒られるっぽい (VOICEVOXの仕様)
         let voicevox_output_sampling_rate = std::env::var("VOICEVOX_OUTPUT_SAMPLING_RATE")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v >= 8_000 && *v <= 96_000 && *v % 24_000 == 0)
             .unwrap_or(48_000);
-        let voicevox_preload_on_startup = std::env::var("VOICEVOX_PRELOAD_ON_STARTUP")
-            .ok()
-            .map(|v| {
-                let normalized = v.trim().to_ascii_lowercase();
-                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(true);
         let voicevox_open_jtalk_dict_dir = std::env::var("VOICEVOX_OPEN_JTALK_DICT_DIR")
             .unwrap_or_else(|_| "voicevox_core/dict/open_jtalk_dic_utf_8-1.11".to_string());
         let voicevox_vvm_dir = std::env::var("VOICEVOX_VVM_DIR")
@@ -90,16 +85,14 @@ impl Config {
             rate_limit_sec_per_cost: 600,
             cron_rate_limit_window_size: 3600,
             cron_rate_limit_sec_per_run: 3600,
-            admin_users: vec![855371530270408725],
+            admin_users,
             timeout_millis: 100_000,
             context_compaction_token_limit,
             context_summary_max_output_tokens,
             voicevox_default_speaker,
             voicevox_core_acceleration,
             voicevox_core_cpu_threads,
-            voicevox_core_load_all_models,
             voicevox_output_sampling_rate,
-            voicevox_preload_on_startup,
             voicevox_open_jtalk_dict_dir,
             voicevox_vvm_dir,
             voicevox_onnxruntime_filename,

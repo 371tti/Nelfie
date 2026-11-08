@@ -1,7 +1,7 @@
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
 use log::{error, info};
-use serenity::{Client, all::GatewayIntents};
+use serenity::{all::GatewayIntents, client::ClientBuilder, http::HttpBuilder};
 use songbird::SerenityInit;
 
 use crate::{
@@ -11,6 +11,8 @@ use crate::{
         voice_events::start_auto_leave_monitor,
     },
 };
+
+const DISCORD_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("Discord client starting");
@@ -56,7 +58,16 @@ pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + S
         | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let discord_client = Client::builder(ob_ctx.config.discord_token.clone(), intents)
+    let http = HttpBuilder::new(&ob_ctx.config.discord_token)
+        .client(
+            serenity_reqwest::Client::builder()
+                .use_rustls_tls()
+                .timeout(DISCORD_HTTP_REQUEST_TIMEOUT)
+                .build()?,
+        )
+        .build();
+
+    let discord_client = ClientBuilder::new_with_http(http, intents)
         .register_songbird()
         .framework(framework);
 

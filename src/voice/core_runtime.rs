@@ -62,6 +62,11 @@ struct DiscoveredModel {
     version_key: String,
 }
 
+struct VvmInstallFailure {
+    message: String,
+    rollback_error: Option<String>,
+}
+
 struct VoiceVoxInitDownloader;
 
 impl VoiceVoxInitDownloader {
@@ -557,15 +562,112 @@ impl CoreRuntime {
         Ok(false)
     }
 
-    fn remove_existing_vvm_files(vvm_dir: &Path) -> Result<usize, String> {
-        let vvm_files = Self::collect_files_with_extension(vvm_dir, "vvm", "VVM")?;
+    fn rollback_vvm_install(
+        backup_dir: &Path,
+        backed_up: &[PathBuf],
+        installed: &[PathBuf],
+    ) -> Result<(), String> {
+        let mut failures = Vec::new();
 
-        for path in &vvm_files {
-            std::fs::remove_file(path)
-                .map_err(|e| format!("failed to remove old VVM file '{}': {e}", path.display()))?;
+        for path in installed.iter().rev() {
+            if let Err(error) = std::fs::remove_file(path) {
+                failures.push(format!(
+                    "failed to remove new VVM '{}': {error}",
+                    path.display()
+                ));
+            }
         }
 
-        Ok(vvm_files.len())
+        for path in backed_up.iter().rev() {
+            let Some(file_name) = path.file_name() else {
+                failures.push(format!("old VVM path '{}' has no filename", path.display()));
+                continue;
+            };
+            let backup_path = backup_dir.join(file_name);
+            if let Err(error) = std::fs::rename(&backup_path, path) {
+                failures.push(format!(
+                    "failed to restore old VVM '{}' from '{}': {error}",
+                    path.display(),
+                    backup_path.display()
+                ));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn install_vvm_assets(
+        vvm_dir: &Path,
+        staged_vvm_dir: &Path,
+        backup_dir: &Path,
+    ) -> Result<(), VvmInstallFailure> {
+        let old_files =
+            Self::collect_files_with_extension(vvm_dir, "vvm", "VVM").map_err(|message| {
+                VvmInstallFailure {
+                    message,
+                    rollback_error: None,
+                }
+            })?;
+        let new_files = Self::collect_files_with_extension(staged_vvm_dir, "vvm", "staged VVM")
+            .map_err(|message| VvmInstallFailure {
+                message,
+                rollback_error: None,
+            })?;
+
+        std::fs::create_dir_all(backup_dir).map_err(|error| VvmInstallFailure {
+            message: format!(
+                "failed to create VVM backup directory '{}': {error}",
+                backup_dir.display()
+            ),
+            rollback_error: None,
+        })?;
+
+        let mut backed_up = Vec::new();
+        for path in &old_files {
+            let Some(file_name) = path.file_name() else {
+                return Err(VvmInstallFailure {
+                    message: format!("old VVM path '{}' has no filename", path.display()),
+                    rollback_error: Self::rollback_vvm_install(backup_dir, &backed_up, &[]).err(),
+                });
+            };
+            let backup_path = backup_dir.join(file_name);
+            if let Err(error) = std::fs::rename(path, &backup_path) {
+                return Err(VvmInstallFailure {
+                    message: format!("failed to stage old VVM '{}': {error}", path.display()),
+                    rollback_error: Self::rollback_vvm_install(backup_dir, &backed_up, &[]).err(),
+                });
+            }
+            backed_up.push(path.clone());
+        }
+
+        let mut installed = Vec::new();
+        for staged_path in &new_files {
+            let Some(file_name) = staged_path.file_name() else {
+                return Err(VvmInstallFailure {
+                    message: format!(
+                        "staged VVM path '{}' has no filename",
+                        staged_path.display()
+                    ),
+                    rollback_error: Self::rollback_vvm_install(backup_dir, &backed_up, &installed)
+                        .err(),
+                });
+            };
+            let path = vvm_dir.join(file_name);
+            if let Err(error) = std::fs::rename(staged_path, &path) {
+                return Err(VvmInstallFailure {
+                    message: format!("failed to install VVM '{}': {error}", path.display()),
+                    rollback_error: Self::rollback_vvm_install(backup_dir, &backed_up, &installed)
+                        .err(),
+                });
+            }
+            installed.push(path);
+        }
+
+        Ok(())
     }
 
     async fn download_asset_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -753,7 +855,10 @@ impl CoreRuntime {
             )
         })?;
 
-        let models_root = vvm_dir.parent().unwrap_or(vvm_dir);
+        let models_root = vvm_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let marker_path = models_root.join(VVM_RELEASE_MARKER_FILE);
         let has_local_assets = Self::has_vvm_assets(vvm_dir)?;
 
@@ -788,11 +893,6 @@ impl CoreRuntime {
                 release.tag_name,
                 current_tag.unwrap_or_else(|| "<none>".to_string())
             );
-
-            let removed = Self::remove_existing_vvm_files(vvm_dir)?;
-            if removed > 0 {
-                info!("removed {} old VVM file(s) before refresh", removed);
-            }
         } else {
             info!(
                 "VVM assets not found at '{}'; downloading compatible release '{}'",
@@ -801,31 +901,114 @@ impl CoreRuntime {
             );
         }
 
-        let downloaded = Self::download_vvm_assets_parallel(&release, vvm_dir).await?;
+        let mut staging = match tempfile::tempdir_in(models_root) {
+            Ok(staging) => staging,
+            Err(error) if has_local_assets => {
+                warn!(
+                    "failed to create VVM staging directory in '{}': {error}. using existing local VVMs under '{}'",
+                    models_root.display(),
+                    vvm_dir.display()
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create VVM staging directory in '{}': {error}",
+                    models_root.display()
+                ));
+            }
+        };
+        let staged_vvm_dir = staging.path().join("vvms");
+        if let Err(error) = std::fs::create_dir_all(&staged_vvm_dir) {
+            let message = format!(
+                "failed to create staged VVM directory '{}': {error}",
+                staged_vvm_dir.display()
+            );
+            if has_local_assets {
+                warn!(
+                    "{message}. using existing local VVMs under '{}'",
+                    vvm_dir.display()
+                );
+                return Ok(());
+            }
+            return Err(message);
+        }
 
-        let readme_path = models_root.join(MODELS_README_FILE);
-        Self::write_release_asset_if_exists(
-            &release,
-            MODELS_README_FILE,
-            &readme_path,
-            "models README",
-        )
-        .await?;
+        let staged_assets = async {
+            let downloaded = Self::download_vvm_assets_parallel(&release, &staged_vvm_dir).await?;
+            if !Self::has_vvm_assets(&staged_vvm_dir)? {
+                return Err(format!(
+                    "VVM download finished but staged directory '{}' contains no VVM files",
+                    staged_vvm_dir.display()
+                ));
+            }
 
-        let terms_path = models_root.join(MODELS_TERMS_FILE);
-        Self::write_release_asset_if_exists(
-            &release,
-            MODELS_TERMS_FILE,
-            &terms_path,
-            "models terms",
-        )
-        .await?;
+            Self::write_release_asset_if_exists(
+                &release,
+                MODELS_README_FILE,
+                &staging.path().join(MODELS_README_FILE),
+                "models README",
+            )
+            .await?;
+            Self::write_release_asset_if_exists(
+                &release,
+                MODELS_TERMS_FILE,
+                &staging.path().join(MODELS_TERMS_FILE),
+                "models terms",
+            )
+            .await?;
+            Ok::<usize, String>(downloaded)
+        }
+        .await;
 
-        if !Self::has_vvm_assets(vvm_dir)? {
-            return Err(format!(
-                "VVM download finished but '{}' is still unavailable",
-                vvm_dir.display()
-            ));
+        let downloaded = match staged_assets {
+            Ok(downloaded) => downloaded,
+            Err(error) if has_local_assets => {
+                warn!(
+                    "failed to stage VVM update: {}. using existing local VVMs under '{}'",
+                    error,
+                    vvm_dir.display()
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let backup_dir = staging.path().join("old-vvms");
+        if let Err(failure) = Self::install_vvm_assets(vvm_dir, &staged_vvm_dir, &backup_dir) {
+            if let Some(rollback_error) = failure.rollback_error {
+                let recovery_dir = staging.keep();
+                return Err(format!(
+                    "{}; rollback failed: {}; recovery files were retained at '{}'",
+                    failure.message,
+                    rollback_error,
+                    recovery_dir.display()
+                ));
+            }
+            if has_local_assets {
+                warn!(
+                    "failed to install VVM update: {}. restored and using existing local VVMs under '{}'",
+                    failure.message,
+                    vvm_dir.display()
+                );
+                return Ok(());
+            }
+            return Err(failure.message);
+        }
+
+        for file_name in [MODELS_README_FILE, MODELS_TERMS_FILE] {
+            let staged_path = staging.path().join(file_name);
+            if staged_path.is_file() {
+                match std::fs::read(&staged_path).and_then(|contents| {
+                    crate::app::atomic_file::write(&models_root.join(file_name), &contents)
+                }) {
+                    Ok(()) => {}
+                    Err(error) => warn!(
+                        "failed to update VOICEVOX metadata file '{}': {error}",
+                        models_root.join(file_name).display()
+                    ),
+                }
+            }
         }
 
         info!(
@@ -833,12 +1016,15 @@ impl CoreRuntime {
             release.tag_name, downloaded
         );
 
-        std::fs::write(&marker_path, format!("{}\n", release.tag_name)).map_err(|e| {
-            format!(
-                "failed to write VVM release marker '{}': {e}",
+        if let Err(error) = crate::app::atomic_file::write(
+            &marker_path,
+            format!("{}\n", release.tag_name).as_bytes(),
+        ) {
+            warn!(
+                "failed to write VVM release marker '{}': {error}; the next startup will retry the update",
                 marker_path.display()
-            )
-        })?;
+            );
+        }
 
         Ok(())
     }
@@ -1270,12 +1456,6 @@ impl CoreRuntime {
             warn!(
                 "skipped {} VVM file(s) due to version mismatch with selected '{}'",
                 skipped_models, selected_version
-            );
-        }
-
-        if !config.load_all_models {
-            warn!(
-                "VOICEVOX load_all_models=false is ignored in concurrent mode; preloading all selected VVMs"
             );
         }
 

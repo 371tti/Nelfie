@@ -1,10 +1,16 @@
 use serenity::all::{ChannelId, GuildId};
 
+pub const VOICE_PARALLEL_COUNT_DEFAULT: usize = 1;
+pub const VOICE_PARALLEL_COUNT_MAX: usize = 4;
+
+pub(crate) fn normalize_parallel_count(parallel_count: usize) -> usize {
+    parallel_count.clamp(VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX)
+}
+
 #[derive(Clone, Debug)]
 pub struct VoiceCoreConfig {
     pub acceleration_mode: String,
     pub cpu_threads: u16,
-    pub load_all_models: bool,
     pub output_sampling_rate: u32,
     pub open_jtalk_dict_dir: String,
     pub vvm_dir: String,

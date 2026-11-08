@@ -5,6 +5,8 @@ use serenity::all::{ChannelId, GuildId};
 
 use crate::{app::context::NelfieContext, llm::tool::LMTool};
 
+use super::{get_opt_non_empty_trimmed_str_arg, get_non_empty_trimmed_str_arg};
+
 pub struct CronTool;
 
 impl CronTool {
@@ -12,28 +14,13 @@ impl CronTool {
         Self
     }
 
-    fn get_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Result<&'a str, String> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("Missing or invalid '{key}' parameter"))
-    }
-
-    fn get_opt_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Option<&'a str> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-    }
-
     fn parse_guild_id(args: &serde_json::Value) -> Result<GuildId, String> {
-        let guild_id = Self::get_str_arg(args, "guild_id")?;
+        let guild_id = get_non_empty_trimmed_str_arg(args, "guild_id")?;
         GuildId::from_str(guild_id).map_err(|e| format!("Invalid 'guild_id': {e}"))
     }
 
     fn parse_channel_id(args: &serde_json::Value) -> Result<ChannelId, String> {
-        let channel_id = Self::get_str_arg(args, "channel_id")?;
+        let channel_id = get_non_empty_trimmed_str_arg(args, "channel_id")?;
         ChannelId::from_str(channel_id).map_err(|e| format!("Invalid 'channel_id': {e}"))
     }
 
@@ -112,14 +99,14 @@ impl LMTool for CronTool {
         args: serde_json::Value,
         ob_ctx: NelfieContext,
     ) -> Result<String, String> {
-        let operation = Self::get_str_arg(&args, "operation")?;
+        let operation = get_non_empty_trimmed_str_arg(&args, "operation")?;
 
         match operation {
             "create" => {
                 let guild_id = Self::parse_guild_id(&args)?;
                 let channel_id = Self::parse_channel_id(&args)?;
-                let schedule = Self::get_str_arg(&args, "schedule")?.to_string();
-                let prompt = Self::get_str_arg(&args, "prompt")?.to_string();
+                let schedule = get_non_empty_trimmed_str_arg(&args, "schedule")?.to_string();
+                let prompt = get_non_empty_trimmed_str_arg(&args, "prompt")?.to_string();
                 let bot_user_id = ob_ctx.discord_client.open().cache.current_user().id;
 
                 let job = ob_ctx.cron_scheduler.register(
@@ -145,7 +132,7 @@ impl LMTool for CronTool {
                     .unwrap_or(50)
                     .clamp(1, 100) as usize;
 
-                let mut jobs = if let Some(channel_id) = Self::get_opt_str_arg(&args, "channel_id")
+                let mut jobs = if let Some(channel_id) = get_opt_non_empty_trimmed_str_arg(&args, "channel_id")
                 {
                     let channel_id = ChannelId::from_str(channel_id)
                         .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
@@ -169,7 +156,7 @@ impl LMTool for CronTool {
                 .to_string())
             }
             "delete" => {
-                let id = Self::get_str_arg(&args, "id")?;
+                let id = get_non_empty_trimmed_str_arg(&args, "id")?;
                 let guild_id = Self::parse_guild_id(&args)?;
                 let job = ob_ctx.cron_scheduler.delete_job(id, Some(guild_id))?;
 

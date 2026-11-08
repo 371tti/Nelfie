@@ -21,46 +21,19 @@ pub(super) async fn send_long_message(
 ) -> Result<(), serenity::Error> {
     let (text, attachments) = extract_code_blocks(text);
     let text = text.trim();
+    let chunks = response_message_chunks(text, footer, None);
 
-    if text.is_empty() {
-        if !attachments.is_empty() {
-            send_code_attachments(http, channel_id, &attachments).await?;
-        }
-        if !footer.is_empty() {
-            channel_id
-                .send_message(http, CreateMessage::new().content(footer))
-                .await?;
-        }
-        return Ok(());
+    if text.is_empty() && !attachments.is_empty() {
+        send_code_attachments(http, channel_id, &attachments).await?;
     }
 
-    let total_len = discord_character_count(text) + 1 + discord_character_count(footer);
-    if !footer.is_empty() && total_len <= DISCORD_MESSAGE_LIMIT {
+    for chunk in chunks {
         channel_id
-            .send_message(
-                http,
-                CreateMessage::new().content(format!("{}\n{}", text, footer)),
-            )
+            .send_message(http, CreateMessage::new().content(chunk))
             .await?;
-    } else {
-        let chunks = split_message_chunks(text, DISCORD_MESSAGE_LIMIT);
-        for chunk in chunks {
-            if chunk.trim().is_empty() {
-                continue;
-            }
-            channel_id
-                .send_message(http, CreateMessage::new().content(chunk))
-                .await?;
-        }
-
-        if !footer.is_empty() {
-            channel_id
-                .send_message(http, CreateMessage::new().content(footer))
-                .await?;
-        }
     }
 
-    if !attachments.is_empty() {
+    if !text.is_empty() && !attachments.is_empty() {
         send_code_attachments(http, channel_id, &attachments).await?;
     }
 
@@ -110,77 +83,25 @@ pub(super) async fn send_modal_ephemeral_response(
 ) -> Result<(), serenity::Error> {
     let (text, attachments) = extract_code_blocks(text);
     let text = text.trim();
+    let mut chunks =
+        response_message_chunks(text, footer, Some(MODAL_EMPTY_RESPONSE_MESSAGE)).into_iter();
 
-    if text.is_empty() {
+    let first_chunk = chunks
+        .next()
+        .unwrap_or_else(|| MODAL_EMPTY_RESPONSE_MESSAGE.to_string());
+    modal
+        .edit_response(http, EditInteractionResponse::new().content(first_chunk))
+        .await?;
+
+    for chunk in chunks {
         modal
-            .edit_response(
+            .create_followup(
                 http,
-                EditInteractionResponse::new().content(if footer.is_empty() {
-                    MODAL_EMPTY_RESPONSE_MESSAGE
-                } else {
-                    footer
-                }),
+                CreateInteractionResponseFollowup::new()
+                    .content(chunk)
+                    .ephemeral(true),
             )
             .await?;
-    } else {
-        let total_len = discord_character_count(text)
-            + if footer.is_empty() {
-                0
-            } else {
-                1 + discord_character_count(footer)
-            };
-
-        if !footer.is_empty() && total_len <= DISCORD_MESSAGE_LIMIT {
-            modal
-                .edit_response(
-                    http,
-                    EditInteractionResponse::new().content(format!("{}\n{}", text, footer)),
-                )
-                .await?;
-        } else {
-            let mut chunks = split_message_chunks(text, DISCORD_MESSAGE_LIMIT)
-                .into_iter()
-                .filter(|chunk| !chunk.trim().is_empty());
-
-            if let Some(first_chunk) = chunks.next() {
-                modal
-                    .edit_response(http, EditInteractionResponse::new().content(first_chunk))
-                    .await?;
-            } else {
-                modal
-                    .edit_response(
-                        http,
-                        EditInteractionResponse::new().content(if footer.is_empty() {
-                            MODAL_EMPTY_RESPONSE_MESSAGE
-                        } else {
-                            footer
-                        }),
-                    )
-                    .await?;
-            }
-
-            for chunk in chunks {
-                modal
-                    .create_followup(
-                        http,
-                        CreateInteractionResponseFollowup::new()
-                            .content(chunk)
-                            .ephemeral(true),
-                    )
-                    .await?;
-            }
-
-            if !footer.is_empty() {
-                modal
-                    .create_followup(
-                        http,
-                        CreateInteractionResponseFollowup::new()
-                            .content(footer)
-                            .ephemeral(true),
-                    )
-                    .await?;
-            }
-        }
     }
 
     if !attachments.is_empty() {
@@ -188,6 +109,32 @@ pub(super) async fn send_modal_ephemeral_response(
     }
 
     Ok(())
+}
+
+fn response_message_chunks(text: &str, footer: &str, empty_fallback: Option<&str>) -> Vec<String> {
+    if text.is_empty() {
+        return if footer.is_empty() {
+            empty_fallback.into_iter().map(str::to_owned).collect()
+        } else {
+            vec![footer.to_string()]
+        };
+    }
+
+    if !footer.is_empty()
+        && discord_character_count(text) + 1 + discord_character_count(footer)
+            <= DISCORD_MESSAGE_LIMIT
+    {
+        return vec![format!("{text}\n{footer}")];
+    }
+
+    let mut chunks = split_message_chunks(text, DISCORD_MESSAGE_LIMIT)
+        .into_iter()
+        .filter(|chunk| !chunk.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !footer.is_empty() {
+        chunks.push(footer.to_string());
+    }
+    chunks
 }
 
 async fn send_modal_code_attachments(

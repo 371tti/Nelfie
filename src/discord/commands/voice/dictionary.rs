@@ -1,17 +1,21 @@
+use std::time::Duration;
+
+use log::warn;
 use serenity::all::{
     ButtonStyle, ComponentInteractionCollector, CreateActionRow, CreateButton, CreateEmbed,
     CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
     EditInteractionResponse, EditMessage, InteractionResponseFlags, MessageFlags,
 };
 
-use crate::llm::channel::VOICE_DICTIONARY_MAX_ENTRIES;
-use crate::llm::channel::VoiceDictionaryEntry;
+use crate::llm::voice_dictionary::{VOICE_DICTIONARY_MAX_ENTRIES, VoiceDictionaryEntry};
+use tokio::time::timeout;
 
 use super::super::shared::{Context, Error, preview_text};
 use super::support::{require_vc_guild, send_vc_embed, send_vc_error, speak_vc_system_message};
 
 const VOICE_DICTIONARY_PAGE_SIZE: usize = 10;
 const VOICE_DICTIONARY_PAGE_TIMEOUT_SECS: u64 = 14 * 60;
+const VOICE_DICTIONARY_COMPONENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn send_dictionary_list(
     ctx: &Context<'_>,
@@ -99,8 +103,9 @@ async fn send_dictionary_list(
             id if id == next_button_id.as_str() => (page + 1).min(page_count),
             _ => page,
         };
-        interaction
-            .create_response(
+        match timeout(
+            VOICE_DICTIONARY_COMPONENT_TIMEOUT,
+            interaction.create_response(
                 ctx.serenity_context(),
                 CreateInteractionResponse::UpdateMessage(
                     CreateInteractionResponseMessage::new()
@@ -115,32 +120,55 @@ async fn send_dictionary_list(
                             false,
                         )),
                 ),
-            )
-            .await?;
+            ),
+        )
+        .await
+        {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {
+                warn!("timed out updating voice dictionary page; stopping the component collector");
+                break;
+            }
+        }
     }
 
     let disabled_components =
         dictionary_page_buttons(&previous_button_id, &next_button_id, page, page_count, true);
     match ctx {
         poise::Context::Application(app_ctx) => {
-            app_ctx
-                .interaction
-                .edit_response(
+            match timeout(
+                VOICE_DICTIONARY_COMPONENT_TIMEOUT,
+                app_ctx.interaction.edit_response(
                     app_ctx.serenity_context,
                     EditInteractionResponse::new().components(disabled_components),
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_) => warn!("timed out disabling voice dictionary page buttons"),
+            }
         }
         poise::Context::Prefix(prefix_ctx) => {
-            prefix_ctx
-                .msg
-                .channel_id
-                .edit_message(
+            match timeout(
+                VOICE_DICTIONARY_COMPONENT_TIMEOUT,
+                prefix_ctx.msg.channel_id.edit_message(
                     prefix_ctx.serenity_context,
                     message_id,
                     EditMessage::new().components(disabled_components),
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_) => warn!("timed out disabling voice dictionary page buttons"),
+            }
         }
     }
 

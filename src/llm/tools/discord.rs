@@ -12,6 +12,8 @@ use crate::{
     llm::{context::Role, tool::LMTool},
 };
 
+use super::{get_opt_str_arg, get_str_arg};
+
 pub struct DiscordTool;
 
 impl DiscordTool {
@@ -19,22 +21,12 @@ impl DiscordTool {
         DiscordTool {}
     }
 
-    fn get_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Result<&'a str, String> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("Missing or invalid '{key}' parameter"))
-    }
-
     fn get_opt_bool_arg(args: &serde_json::Value, key: &str) -> Option<bool> {
         args.get(key).and_then(|v| v.as_bool())
     }
 
-    fn get_opt_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Option<&'a str> {
-        args.get(key).and_then(|v| v.as_str())
-    }
-
     fn parse_guild_id(args: &serde_json::Value) -> Result<GuildId, String> {
-        let guild_id_str = Self::get_str_arg(args, "guild_id")?;
+        let guild_id_str = get_str_arg(args, "guild_id")?;
         GuildId::from_str(guild_id_str).map_err(|e| format!("Invalid 'guild_id': {e}"))
     }
 
@@ -249,11 +241,11 @@ impl LMTool for DiscordTool {
             // Reaction: add
             // --------------------
             "add_reaction" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let message_id_str = Self::get_str_arg(&args, "message_id")?;
-                let reaction = Self::get_str_arg(&args, "reaction")?;
+                let message_id_str = get_str_arg(&args, "message_id")?;
+                let reaction = get_str_arg(&args, "reaction")?;
 
                 let message_id = MessageId::from_str(message_id_str)
                     .map_err(|e| format!("Invalid 'message_id': {e}"))?;
@@ -277,11 +269,11 @@ impl LMTool for DiscordTool {
             // Reaction: remove
             // --------------------
             "remove_reaction" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let message_id_str = Self::get_str_arg(&args, "message_id")?;
-                let reaction = Self::get_str_arg(&args, "reaction")?;
+                let message_id_str = get_str_arg(&args, "message_id")?;
+                let reaction = get_str_arg(&args, "reaction")?;
 
                 let message_id = MessageId::from_str(message_id_str)
                     .map_err(|e| format!("Invalid 'message_id': {e}"))?;
@@ -305,10 +297,10 @@ impl LMTool for DiscordTool {
             // Thread: create
             // --------------------
             "create_thread" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let name = Self::get_str_arg(&args, "name")?;
+                let name = get_str_arg(&args, "name")?;
 
                 let message_id_str_opt = args.get("message_id").and_then(|v| v.as_str());
                 let thread_type_str = args
@@ -363,10 +355,10 @@ impl LMTool for DiscordTool {
             // Send message
             // --------------------
             "send_message" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let content = Self::get_str_arg(&args, "content")?;
+                let content = get_str_arg(&args, "content")?;
 
                 let reply_to_str = args.get("reply_to").and_then(|v| v.as_str());
 
@@ -399,8 +391,8 @@ impl LMTool for DiscordTool {
             // Send ephemeral interaction message to the current modal respondent
             // --------------------
             "send_ephemeral_message" => {
-                let content = Self::get_str_arg(&args, "content")?;
-                let user_id = Self::get_opt_str_arg(&args, "user_id")
+                let content = get_str_arg(&args, "content")?;
+                let user_id = get_opt_str_arg(&args, "user_id")
                     .map(|raw| UserId::from_str(raw).map_err(|e| format!("Invalid 'user_id': {e}")))
                     .transpose()?;
 
@@ -441,11 +433,11 @@ impl LMTool for DiscordTool {
             // Edit message
             // --------------------
             "edit_message" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let message_id_str = Self::get_str_arg(&args, "message_id")?;
-                let content = Self::get_str_arg(&args, "content")?;
+                let message_id_str = get_str_arg(&args, "message_id")?;
+                let content = get_str_arg(&args, "content")?;
 
                 let message_id = MessageId::from_str(message_id_str)
                     .map_err(|e| format!("Invalid 'message_id': {e}"))?;
@@ -473,10 +465,10 @@ impl LMTool for DiscordTool {
             // Fetch message
             // --------------------
             "fetch_message" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let message_id_str = Self::get_str_arg(&args, "message_id")?;
+                let message_id_str = get_str_arg(&args, "message_id")?;
                 let message_id = MessageId::from_str(message_id_str)
                     .map_err(|e| format!("Invalid 'message_id': {e}"))?;
 
@@ -503,10 +495,10 @@ impl LMTool for DiscordTool {
             // Search messages
             // --------------------
             "search_messages" => {
-                let channel_id_str = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id_str = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id_str)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
-                let query = Self::get_str_arg(&args, "query")?;
+                let query = get_str_arg(&args, "query")?;
 
                 let limit = args
                     .get("limit")
@@ -552,7 +544,7 @@ impl LMTool for DiscordTool {
             "list_channels" => {
                 let guild_id = Self::parse_guild_id(&args)?;
                 let guild_id_str = guild_id.to_string();
-                let filter = Self::get_opt_str_arg(&args, "channel_type").unwrap_or("all");
+                let filter = get_opt_str_arg(&args, "channel_type").unwrap_or("all");
                 let include_members =
                     Self::get_opt_bool_arg(&args, "include_members").unwrap_or(false);
 
@@ -656,7 +648,7 @@ impl LMTool for DiscordTool {
                 let guild_id = Self::parse_guild_id(&args)?;
                 let guild_id_str = guild_id.to_string();
 
-                let filter_channel_id = match Self::get_opt_str_arg(&args, "channel_id") {
+                let filter_channel_id = match get_opt_str_arg(&args, "channel_id") {
                     Some(s) => Some(
                         ChannelId::from_str(s).map_err(|e| format!("Invalid 'channel_id': {e}"))?,
                     ),

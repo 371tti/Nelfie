@@ -1,10 +1,8 @@
 use serenity::all::{AutocompleteChoice, CreateEmbed, ResolvedValue};
 
 use crate::{
-    llm::channel::{
-        VOICE_DICTIONARY_MAX_ENTRIES, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX,
-    },
-    voice::voice_catalog,
+    llm::voice_dictionary::VOICE_DICTIONARY_MAX_ENTRIES,
+    voice::{voice_catalog, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX},
 };
 
 use super::super::shared::{Context, Error};
@@ -265,12 +263,11 @@ pub async fn vc_status(ctx: Context<'_>) -> Result<(), Error> {
         )
         .field("voicevox_core", ob_ctx.voice_system.core_summary(), false)
         .field(
-            "acceleration/cpu_threads/load_all_models",
+            "acceleration/cpu_threads",
             format!(
-                "{} / {} / {}",
+                "{} / {}",
                 ob_ctx.config.voicevox_core_acceleration,
-                ob_ctx.config.voicevox_core_cpu_threads,
-                ob_ctx.config.voicevox_core_load_all_models
+                ob_ctx.config.voicevox_core_cpu_threads
             ),
             false,
         )

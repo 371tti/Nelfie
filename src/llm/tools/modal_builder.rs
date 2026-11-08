@@ -8,6 +8,8 @@ use serenity::all::{
 
 use crate::llm::tool::LMTool;
 
+use super::get_str_arg;
+
 pub const MODAL_TRIGGER_PREFIX: &str = "modal_builder:open:";
 const MODAL_TRIGGER_VERSION: &str = "v1:";
 pub const MODAL_SUBMIT_PREFIX: &str = "modal_builder:submit:";
@@ -46,15 +48,9 @@ impl ModalBuilderTool {
         ModalBuilderTool {}
     }
 
-    fn get_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Result<&'a str, String> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("Missing or invalid '{key}' parameter"))
-    }
-
     fn parse_modal_spec(args: &serde_json::Value) -> Result<ModalSpec, String> {
-        let title = Self::get_str_arg(args, "title")?.to_string();
-        let logical_custom_id = Self::get_str_arg(args, "custom_id")?.to_string();
+        let title = get_str_arg(args, "title")?.to_string();
+        let logical_custom_id = get_str_arg(args, "custom_id")?.to_string();
         let inputs = args
             .get("inputs")
             .and_then(|v| v.as_array())
@@ -596,7 +592,7 @@ impl LMTool for ModalBuilderTool {
             }
             "build_and_send_trigger" => {
                 let spec = Self::parse_modal_spec(&args)?;
-                let channel_id = Self::get_str_arg(&args, "channel_id")?;
+                let channel_id = get_str_arg(&args, "channel_id")?;
                 let channel_id = ChannelId::from_str(channel_id)
                     .map_err(|e| format!("Invalid 'channel_id': {e}"))?;
                 let trigger_custom_id = encode_modal_trigger_custom_id(&spec)?;

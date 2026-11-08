@@ -3,15 +3,18 @@ use serenity::all::{ChannelId, GuildId, UserId};
 
 use crate::{
     app::context::NelfieContext,
-    llm::channel::{
-        VOICE_DICTIONARY_MAX_ENTRIES, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX,
-    },
     llm::{
         tool::{LMTool, ToolExecutionContext},
         user::UserContextScope,
+        voice_dictionary::VOICE_DICTIONARY_MAX_ENTRIES,
     },
-    voice::{SpeakOptions, apply_tts_dictionary, voice_catalog},
+    voice::{
+        SpeakOptions, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX,
+        apply_tts_dictionary, normalize_parallel_count, voice_catalog,
+    },
 };
+
+use super::{get_opt_str_arg, get_str_arg};
 
 pub struct VoicevoxTool;
 
@@ -20,20 +23,10 @@ impl VoicevoxTool {
         Self {}
     }
 
-    fn get_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Result<&'a str, String> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("Missing or invalid '{key}' parameter"))
-    }
-
     fn get_bool_arg(args: &serde_json::Value, key: &str) -> Result<bool, String> {
         args.get(key)
             .and_then(|v| v.as_bool())
             .ok_or_else(|| format!("Missing or invalid '{key}' parameter"))
-    }
-
-    fn get_optional_str_arg<'a>(args: &'a serde_json::Value, key: &'a str) -> Option<&'a str> {
-        args.get(key).and_then(|v| v.as_str()).map(str::trim)
     }
 
     fn parse_id(raw: &str, key: &str) -> Result<u64, String> {
@@ -54,7 +47,7 @@ impl VoicevoxTool {
     }
 
     fn get_guild_arg(args: &serde_json::Value) -> Result<(GuildId, String), String> {
-        let guild_raw = Self::get_str_arg(args, "guild_id")?;
+        let guild_raw = get_str_arg(args, "guild_id")?;
         let guild_id = GuildId::new(Self::parse_id(guild_raw, "guild_id")?);
         Ok((guild_id, guild_raw.to_string()))
     }
@@ -153,7 +146,7 @@ impl VoicevoxTool {
         let value = usize::try_from(value)
             .map_err(|_| format!("'{key}' is too large for this platform"))?;
 
-        Ok(value.clamp(VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX))
+        Ok(normalize_parallel_count(value))
     }
 
     fn register_dictionary(
@@ -167,8 +160,8 @@ impl VoicevoxTool {
             .ok_or_else(|| "Missing or invalid 'text_channel_id' parameter".to_string())?;
         let text_channel_id = Self::parse_id_value(text_channel_raw, "text_channel_id")?;
         let text_channel = ChannelId::new(text_channel_id);
-        let source = Self::get_str_arg(args, "dictionary_source")?;
-        let target = Self::get_str_arg(args, "dictionary_target")?;
+        let source = get_str_arg(args, "dictionary_source")?;
+        let target = get_str_arg(args, "dictionary_target")?;
 
         let (count, updated) = ob_ctx.chat_contexts.set_voice_dictionary_entry(
             text_channel,
@@ -308,7 +301,7 @@ impl LMTool for VoicevoxTool {
 
         match operation {
             "list_voice_styles" => {
-                let speaker_filter = Self::get_optional_str_arg(&args, "speaker_name")
+                let speaker_filter = get_opt_str_arg(&args, "speaker_name").map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(|value| value.to_string());
                 let limit = Self::parse_limit_arg(&args, "limit", 128, 512);
@@ -345,7 +338,7 @@ impl LMTool for VoicevoxTool {
                 .to_string())
             }
             "list_voice_speakers" => {
-                let name_filter = Self::get_optional_str_arg(&args, "speaker_name")
+                let name_filter = get_opt_str_arg(&args, "speaker_name").map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(|value| value.to_lowercase());
                 let limit = Self::parse_limit_arg(&args, "limit", 128, 512);
@@ -438,7 +431,7 @@ impl LMTool for VoicevoxTool {
             }
             "speak_text" => {
                 let (guild_id, guild_id_raw) = Self::get_guild_arg(&args)?;
-                let text = Self::get_str_arg(&args, "text")?;
+                let text = get_str_arg(&args, "text")?;
                 let text_channel = Self::get_optional_channel_arg(&args, "text_channel_id")?;
                 let speaker: Option<u32> =
                     Self::get_optional_u32_setting(&args, "speaker")?.unwrap_or_default();
@@ -572,7 +565,7 @@ impl LMTool for VoicevoxTool {
             }
             "set_user_voice" => {
                 let (_guild_id, guild_id_raw) = Self::get_guild_arg(&args)?;
-                let user_raw = Self::get_str_arg(&args, "user_id")?;
+                let user_raw = get_str_arg(&args, "user_id")?;
                 let user_id = UserId::new(Self::parse_id(user_raw, "user_id")?);
 
                 let speaker_update = Self::get_optional_u32_setting(&args, "speaker")?;
@@ -630,7 +623,7 @@ impl LMTool for VoicevoxTool {
             }
             "get_user_voice" => {
                 let (_guild_id, guild_id_raw) = Self::get_guild_arg(&args)?;
-                let user_raw = Self::get_str_arg(&args, "user_id")?;
+                let user_raw = get_str_arg(&args, "user_id")?;
                 let user_id = UserId::new(Self::parse_id(user_raw, "user_id")?);
                 let current = ob_ctx.user_contexts.get_or_create(user_id);
 

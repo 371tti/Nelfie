@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
@@ -19,30 +16,26 @@ use tokio::{
 use super::{
     core_runtime::CoreRuntime,
     text::{normalize_tts_text, normalize_tts_text_full, split_tts_segments},
-    types::{GuildVoiceConfig, SpeakOptions, SpeakRequest, VoiceCoreConfig},
+    types::{
+        GuildVoiceConfig, SpeakOptions, SpeakRequest, VoiceCoreConfig,
+        normalize_parallel_count,
+    },
 };
 
 const LONG_TTS_TEXT_MIN_SPEED: f32 = 1.4;
 const LONG_TTS_TEXT_THRESHOLD_CHARS: usize = 64;
 const SEQUENTIAL_QUEUE_CAPACITY: usize = 16;
-const DEFAULT_PARALLEL_READ_COUNT: usize = 1;
-const MAX_PARALLEL_READ_COUNT: usize = 4;
 const TRACK_END_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const TRACK_END_MAX_CONSECUTIVE_ERRORS: usize = 5;
 const QUEUE_FULL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SEGMENT_SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(45);
 const SEGMENT_PLAYBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn normalize_parallel_count(parallel_count: usize) -> usize {
-    parallel_count.clamp(DEFAULT_PARALLEL_READ_COUNT, MAX_PARALLEL_READ_COUNT)
-}
-
 #[derive(Clone)]
 pub struct VoiceSystem {
     default_speaker: u32,
     core_config: VoiceCoreConfig,
     core_runtime: Arc<OnceCell<Arc<CoreRuntime>>>,
-    core_warmup_started: Arc<AtomicBool>,
     songbird: Arc<RwLock<Option<Arc<Songbird>>>>,
     guild_configs: Arc<DashMap<GuildId, GuildVoiceConfig>>,
     channel_queues: Arc<DashMap<ChannelId, mpsc::Sender<SpeakRequest>>>,
@@ -57,7 +50,6 @@ impl VoiceSystem {
             default_speaker,
             core_config,
             core_runtime: Arc::new(OnceCell::new()),
-            core_warmup_started: Arc::new(AtomicBool::new(false)),
             songbird: Arc::new(RwLock::new(None)),
             guild_configs: Arc::new(DashMap::new()),
             channel_queues: Arc::new(DashMap::new()),
@@ -67,30 +59,7 @@ impl VoiceSystem {
         }
     }
 
-    pub fn warmup_async(&self) {
-        if self.core_warmup_started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-
-        let this = self.clone();
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            match this.ensure_core_initialized().await {
-                Ok(_) => {
-                    info!(
-                        "VOICEVOX core preload completed in {} ms",
-                        started.elapsed().as_millis()
-                    );
-                }
-                Err(e) => {
-                    warn!("VOICEVOX core preload failed: {}", e);
-                }
-            }
-        });
-    }
-
     pub async fn initialize_on_startup(&self) -> Result<(), String> {
-        self.core_warmup_started.store(true, Ordering::SeqCst);
         let started = std::time::Instant::now();
         self.ensure_core_initialized().await?;
         info!(
@@ -205,17 +174,6 @@ impl VoiceSystem {
         self.channel_parallel_semaphores
             .insert(channel_id, Arc::new(Semaphore::new(normalized)));
         normalized
-    }
-
-    pub fn channel_parallel_count(&self, channel_id: ChannelId) -> usize {
-        self.channel_parallel_counts
-            .get(&channel_id)
-            .map(|v| *v.value())
-            .unwrap_or(DEFAULT_PARALLEL_READ_COUNT)
-    }
-
-    pub fn max_parallel_read_count(&self) -> usize {
-        MAX_PARALLEL_READ_COUNT
     }
 
     pub fn sequential_queue_capacity(&self) -> usize {
@@ -390,10 +348,18 @@ impl VoiceSystem {
 
         let mut wav_segments = Vec::with_capacity(segments.len());
         for segment in segments {
-            wav_segments.push(
-                self.synthesize(&segment, speaker, speed_scale, pitch_scale)
-                    .await?,
-            );
+            let wav = timeout(
+                SEGMENT_SYNTHESIS_TIMEOUT,
+                self.synthesize(&segment, speaker, speed_scale, pitch_scale),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "segment synthesis timed out after {:?}",
+                    SEGMENT_SYNTHESIS_TIMEOUT
+                )
+            })??;
+            wav_segments.push(wav);
         }
 
         let wav = concatenate_wav_segments(wav_segments)?;

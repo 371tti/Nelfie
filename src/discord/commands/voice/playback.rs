@@ -2,8 +2,7 @@ use poise::CreateReply;
 use serenity::all::{CreateAttachment, CreateEmbed};
 
 use crate::{
-    llm::channel::{VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX},
-    voice::SpeakOptions,
+    voice::{SpeakOptions, VOICE_PARALLEL_COUNT_DEFAULT, VOICE_PARALLEL_COUNT_MAX},
 };
 
 use super::super::shared::{Context, Error, preview_text};

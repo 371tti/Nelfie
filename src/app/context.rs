@@ -54,7 +54,6 @@ impl NelfieContext {
             VoiceCoreConfig {
                 acceleration_mode: config.voicevox_core_acceleration.clone(),
                 cpu_threads: config.voicevox_core_cpu_threads,
-                load_all_models: config.voicevox_core_load_all_models,
                 output_sampling_rate: config.voicevox_output_sampling_rate,
                 open_jtalk_dict_dir: config.voicevox_open_jtalk_dict_dir.clone(),
                 vvm_dir: config.voicevox_vvm_dir.clone(),

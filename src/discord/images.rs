@@ -2,8 +2,11 @@ use std::collections::HashMap;
 
 use log::warn;
 use serenity::all::{ChannelId, Message, MessageId};
+use tokio::time::{Duration, timeout};
 
 use crate::llm::context::{DiscordImageSource, LMContext};
+
+const DISCORD_IMAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) struct MessageImageAttachment {
     filename: String,
@@ -130,70 +133,95 @@ pub(super) async fn refresh_discord_image_urls_for_api(
         return;
     }
 
-    let mut fetched_messages = HashMap::<(u64, u64), Option<Message>>::new();
+    let refresh = async {
+        let mut fetched_messages = HashMap::<(u64, u64), Option<Message>>::new();
 
-    for source in stale_sources {
-        let key = (source.channel_id, source.message_id);
-        if let std::collections::hash_map::Entry::Vacant(entry) = fetched_messages.entry(key) {
-            let fetched = ChannelId::new(source.channel_id)
-                .message(&ctx.http, MessageId::new(source.message_id))
-                .await;
-            match fetched {
-                Ok(message) => {
-                    entry.insert(Some(message));
+        for source in stale_sources {
+            let key = (source.channel_id, source.message_id);
+            if let std::collections::hash_map::Entry::Vacant(entry) = fetched_messages.entry(key) {
+                let fetched = ChannelId::new(source.channel_id)
+                    .message(&ctx.http, MessageId::new(source.message_id))
+                    .await;
+                match fetched {
+                    Ok(message) => {
+                        entry.insert(Some(message));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "failed to refresh Discord attachment URL from channel {} message {}: {}",
+                            source.channel_id, source.message_id, e
+                        );
+                        entry.insert(None);
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "failed to refresh Discord attachment URL from channel {} message {}: {}",
-                        source.channel_id, source.message_id, e
-                    );
-                    entry.insert(None);
-                }
+            }
+
+            let Some(Some(message)) = fetched_messages.get(&key) else {
+                lm_context.remove_image_url(&source.url);
+                continue;
+            };
+
+            let Some(attachment) = message
+                .attachments
+                .iter()
+                .find(|attachment| attachment.id.get() == source.attachment_id)
+            else {
+                warn!(
+                    "Discord attachment {} no longer exists on message {}",
+                    source.attachment_id, source.message_id
+                );
+                lm_context.remove_image_url(&source.url);
+                continue;
+            };
+
+            if attachment.url.is_empty() {
+                warn!(
+                    "Discord attachment {} on message {} has empty URL",
+                    source.attachment_id, source.message_id
+                );
+                lm_context.remove_image_url(&source.url);
+                continue;
+            }
+
+            let old_url = source.url.clone();
+            let new_url = attachment.url.clone();
+            lm_context.replace_image_url(&old_url, &new_url);
+
+            if let Some(current_source) = lm_context.discord_image_sources.iter_mut().find(|item| {
+                item.channel_id == source.channel_id
+                    && item.message_id == source.message_id
+                    && item.attachment_id == source.attachment_id
+            }) {
+                current_source.url = new_url;
+                current_source.captured_at_unix = now;
             }
         }
 
-        let Some(Some(message)) = fetched_messages.get(&key) else {
-            lm_context.remove_image_url(&source.url);
-            continue;
-        };
+        lm_context.prune_discord_image_sources_to_present_urls();
+    };
 
-        let Some(attachment) = message
-            .attachments
+    if timeout(DISCORD_IMAGE_REFRESH_TIMEOUT, refresh)
+        .await
+        .is_err()
+    {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let unresolved_urls = lm_context
+            .discord_image_sources
             .iter()
-            .find(|attachment| attachment.id.get() == source.attachment_id)
-        else {
-            warn!(
-                "Discord attachment {} no longer exists on message {}",
-                source.attachment_id, source.message_id
-            );
-            lm_context.remove_image_url(&source.url);
-            continue;
-        };
+            .filter(|source| should_refresh_discord_image_source(source, now))
+            .map(|source| source.url.clone())
+            .collect::<Vec<_>>();
 
-        if attachment.url.is_empty() {
-            warn!(
-                "Discord attachment {} on message {} has empty URL",
-                source.attachment_id, source.message_id
-            );
-            lm_context.remove_image_url(&source.url);
-            continue;
+        for url in &unresolved_urls {
+            lm_context.remove_image_url(url);
         }
 
-        let old_url = source.url.clone();
-        let new_url = attachment.url.clone();
-        lm_context.replace_image_url(&old_url, &new_url);
-
-        if let Some(current_source) = lm_context.discord_image_sources.iter_mut().find(|item| {
-            item.channel_id == source.channel_id
-                && item.message_id == source.message_id
-                && item.attachment_id == source.attachment_id
-        }) {
-            current_source.url = new_url;
-            current_source.captured_at_unix = now;
-        }
+        warn!(
+            "timed out refreshing Discord image URLs after {:?}; removed {} unresolved image(s)",
+            DISCORD_IMAGE_REFRESH_TIMEOUT,
+            unresolved_urls.len()
+        );
     }
-
-    lm_context.prune_discord_image_sources_to_present_urls();
 }
 
 #[cfg(test)]

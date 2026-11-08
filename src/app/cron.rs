@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -64,6 +64,7 @@ pub struct CronScheduler {
     started: Arc<AtomicBool>,
     task_handle: Arc<RwLock<Option<AbortHandle>>>,
     seq: Arc<AtomicU64>,
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl CronScheduler {
@@ -74,6 +75,7 @@ impl CronScheduler {
             started: Arc::new(AtomicBool::new(false)),
             task_handle: Arc::new(RwLock::new(None)),
             seq: Arc::new(AtomicU64::new(1)),
+            save_lock: Arc::new(Mutex::new(())),
         };
         scheduler.load_from_disk();
         scheduler
@@ -299,6 +301,10 @@ impl CronScheduler {
     }
 
     fn save_to_disk(&self) {
+        let _save_guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut jobs = self
             .jobs
             .iter()

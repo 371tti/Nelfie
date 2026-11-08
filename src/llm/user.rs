@@ -1,11 +1,17 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Mutex};
 
 use dashmap::DashMap;
 use log::{error, warn};
 use serde_json::{Value, json};
 use serenity::all::{GuildId, UserId};
 
-use crate::llm::channel::{VOICE_DICTIONARY_MAX_ENTRIES, VoiceDictionaryEntry};
+use crate::llm::{
+    parse_u64,
+    voice_dictionary::{
+        entries_as_pairs, entries_from_json, entries_to_json, remove_entry, set_entry,
+        prepare_entry, prepare_source, VoiceDictionaryEntry,
+    },
+};
 use crate::llm::models::{ImageGenerationModels, Models};
 
 const USER_CONTEXTS_STORE_PATH: &str = "data/runtime/user_contexts.json";
@@ -15,6 +21,7 @@ pub struct UserContexts {
     pub contexts: DashMap<UserId, UserContext>,
     pub guild_bot_contexts: DashMap<GuildId, UserContext>,
     store_path: PathBuf,
+    save_lock: Mutex<()>,
 }
 
 /// ユーザー情報の構造体
@@ -87,6 +94,7 @@ impl UserContexts {
             contexts: DashMap::new(),
             guild_bot_contexts: DashMap::new(),
             store_path: PathBuf::from(USER_CONTEXTS_STORE_PATH),
+            save_lock: Mutex::new(()),
         };
         user_contexts.load_from_disk();
         user_contexts
@@ -328,50 +336,23 @@ impl UserContexts {
         target: String,
         registered_by: Option<UserId>,
     ) -> Result<(usize, bool), String> {
-        let source = source.trim().to_string();
-        let target = target.trim().to_string();
-
-        if source.is_empty() {
-            return Err("'source' must not be empty".to_string());
-        }
-        if target.is_empty() {
-            return Err("'target' must not be empty".to_string());
-        }
-
-        let (count, updated) = {
+        let (source, target) = prepare_entry(source, target)?;
+        let result = {
             let mut entry = self
                 .contexts
                 .entry(user_id)
                 .or_insert_with(|| UserContext::new(user_id));
-
-            if let Some(existing) = entry
-                .voice_dictionary
-                .iter_mut()
-                .find(|item| item.source == source)
-            {
-                existing.target = target;
-                existing.updated_by = registered_by;
-                (entry.voice_dictionary.len(), true)
-            } else {
-                if entry.voice_dictionary.len() >= VOICE_DICTIONARY_MAX_ENTRIES {
-                    return Err(format!(
-                        "voice dictionary limit reached for this user: max {} entries",
-                        VOICE_DICTIONARY_MAX_ENTRIES
-                    ));
-                }
-
-                entry.voice_dictionary.push(VoiceDictionaryEntry {
-                    source,
-                    target,
-                    registered_by,
-                    updated_by: registered_by,
-                });
-                (entry.voice_dictionary.len(), false)
-            }
+            set_entry(
+                &mut entry.voice_dictionary,
+                source,
+                target,
+                registered_by,
+                "user",
+            )?
         };
 
         self.save_to_disk();
-        Ok((count, updated))
+        Ok(result)
     }
 
     pub fn remove_voice_dictionary_entry(
@@ -379,29 +360,15 @@ impl UserContexts {
         user_id: UserId,
         source: &str,
     ) -> Result<(usize, Option<String>), String> {
-        let source = source.trim();
-        if source.is_empty() {
-            return Err("'source' must not be empty".to_string());
-        }
-
-        let (count, removed_target) = {
+        let source = prepare_source(source)?;
+        let result = {
             let mut entry = self
                 .contexts
                 .entry(user_id)
                 .or_insert_with(|| UserContext::new(user_id));
-
-            match entry
-                .voice_dictionary
-                .iter()
-                .position(|item| item.source == source)
-            {
-                Some(idx) => {
-                    let removed = entry.voice_dictionary.remove(idx);
-                    (entry.voice_dictionary.len(), Some(removed.target))
-                }
-                None => (entry.voice_dictionary.len(), None),
-            }
+            remove_entry(&mut entry.voice_dictionary, &source)?
         };
+        let (count, removed_target) = result;
 
         if removed_target.is_some() {
             self.save_to_disk();
@@ -413,13 +380,7 @@ impl UserContexts {
     pub fn voice_dictionary_entries(&self, user_id: UserId) -> Vec<(String, String)> {
         self.contexts
             .get(&user_id)
-            .map(|entry| {
-                entry
-                    .voice_dictionary
-                    .iter()
-                    .map(|item| (item.source.clone(), item.target.clone()))
-                    .collect::<Vec<_>>()
-            })
+            .map(|entry| entries_as_pairs(&entry.voice_dictionary))
             .unwrap_or_default()
     }
 
@@ -439,13 +400,7 @@ impl UserContexts {
             UserContextScope::GuildBot { guild_id, .. } => self
                 .guild_bot_contexts
                 .get(&guild_id)
-                .map(|entry| {
-                    entry
-                        .voice_dictionary
-                        .iter()
-                        .map(|item| (item.source.clone(), item.target.clone()))
-                        .collect::<Vec<_>>()
-                })
+                .map(|entry| entries_as_pairs(&entry.voice_dictionary))
                 .unwrap_or_default(),
         }
     }
@@ -470,18 +425,11 @@ impl UserContexts {
             .unwrap_or(0)
     }
 
-    pub fn voice_dictionary_count_scoped(&self, scope: UserContextScope) -> usize {
-        match scope {
-            UserContextScope::User(user_id) => self.voice_dictionary_count(user_id),
-            UserContextScope::GuildBot { guild_id, .. } => self
-                .guild_bot_contexts
-                .get(&guild_id)
-                .map(|entry| entry.voice_dictionary.len())
-                .unwrap_or(0),
-        }
-    }
-
     fn save_to_disk(&self) {
+        let _save_guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let user_default_model_name = Models::USER_DEFAULT_MODEL.to_string();
         let system_model_name = Models::SYSTEM_MODEL.to_string();
         let entries = self
@@ -505,13 +453,6 @@ impl UserContexts {
             "guild_bot_contexts": guild_bot_entries,
         });
 
-        if let Some(parent) = self.store_path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
-        {
-            error!("failed to create user context directory: {}", e);
-            return;
-        }
-
         let body = match serde_json::to_string_pretty(&doc) {
             Ok(v) => v,
             Err(e) => {
@@ -520,7 +461,7 @@ impl UserContexts {
             }
         };
 
-        if let Err(e) = fs::write(&self.store_path, body) {
+        if let Err(e) = crate::app::atomic_file::write(&self.store_path, body.as_bytes()) {
             error!("failed to write user contexts: {}", e);
         }
     }
@@ -574,12 +515,6 @@ impl Default for UserContexts {
     }
 }
 
-fn parse_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
-}
-
 fn user_context_to_json(value: &UserContext, default_model_name: &str) -> Option<Value> {
     let model_name = value.main_model.to_string();
     if model_name == default_model_name
@@ -626,13 +561,7 @@ fn user_context_to_json(value: &UserContext, default_model_name: &str) -> Option
     }
 
     if !value.voice_dictionary.is_empty() {
-        obj["voice_dictionary"] = json!(
-            value
-                .voice_dictionary
-                .iter()
-                .map(VoiceDictionaryEntry::to_json_value)
-                .collect::<Vec<Value>>()
-        );
+        obj["voice_dictionary"] = json!(entries_to_json(&value.voice_dictionary));
     }
 
     Some(obj)
@@ -671,16 +600,7 @@ fn user_context_from_json(ctx: &Value, default_model: Models) -> Option<UserCont
         .get("voice_pan")
         .and_then(Value::as_f64)
         .map(|v| v as f32);
-    let voice_dictionary = ctx
-        .get("voice_dictionary")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(VoiceDictionaryEntry::from_json_value)
-                .take(VOICE_DICTIONARY_MAX_ENTRIES)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let voice_dictionary = entries_from_json(ctx.get("voice_dictionary"));
 
     Some(UserContext {
         user_id,
