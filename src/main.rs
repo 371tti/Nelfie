@@ -4,8 +4,25 @@ use nelfie::app::tcp_monitor::TcpMonitorServer;
 use nelfie::discord::bot;
 use tokio::sync::watch;
 
+fn main() {
+    if nelfie::typst_render::is_worker_process() {
+        nelfie::typst_render::clear_worker_environment();
+        if let Err(error) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+            eprintln!("Typst worker TLS setup failed: {error:?}");
+            std::process::exit(1);
+        }
+        if let Err(error) = nelfie::typst_render::run_worker_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    run_bot();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run_bot() {
     dotenv::dotenv().ok();
     nelfie::logging::init();
     rustls::crypto::aws_lc_rs::default_provider()

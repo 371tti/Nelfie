@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const DISCORD_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCORD_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("Discord client starting");
@@ -51,12 +51,15 @@ pub async fn start(ob_ctx: NelfieContext) -> Result<(), Box<dyn Error + Send + S
         })
         .build();
 
-    let intents = GatewayIntents::GUILDS
+    let mut intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::GUILD_MESSAGE_REACTIONS
         | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::MESSAGE_CONTENT;
+    if ob_ctx.config.discord_presence_intent_enabled {
+        intents |= GatewayIntents::GUILD_PRESENCES;
+    }
 
     let http = HttpBuilder::new(&ob_ctx.config.discord_token)
         .client(

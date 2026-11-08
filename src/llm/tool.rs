@@ -1,13 +1,38 @@
-use async_openai::types::responses::{FunctionTool, Tool};
+use std::sync::Arc;
+
+use async_openai::types::responses::{FunctionTool, InputItem, Tool};
+use serenity::all::ChannelId;
 
 use crate::app::context::NelfieContext;
 use crate::llm::user::UserContextScope;
+use crate::typst_render::TypstDraftStore;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ToolExecutionContext {
+    pub channel_id: ChannelId,
     pub user_context_scope: UserContextScope,
     pub allow_mainline_model_change: bool,
     pub image_generation_enabled: bool,
+    pub response_round: usize,
+    pub typst_drafts: Arc<TypstDraftStore>,
+}
+
+pub struct ToolExecutionResult {
+    pub text: String,
+    pub input_items: Vec<InputItem>,
+    pub input_bytes: usize,
+    pub review_preview_id: Option<String>,
+}
+
+impl ToolExecutionResult {
+    pub fn text(text: String) -> Self {
+        Self {
+            text,
+            input_items: Vec::new(),
+            input_bytes: 0,
+            review_preview_id: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -39,5 +64,16 @@ pub trait LMTool: Send + Sync {
         _context: ToolExecutionContext,
     ) -> Result<String, String> {
         self.execute(args, ob_ctx).await
+    }
+
+    async fn execute_with_context_result(
+        &self,
+        args: serde_json::Value,
+        ob_ctx: NelfieContext,
+        context: ToolExecutionContext,
+    ) -> Result<ToolExecutionResult, String> {
+        self.execute_with_context(args, ob_ctx, context)
+            .await
+            .map(ToolExecutionResult::text)
     }
 }

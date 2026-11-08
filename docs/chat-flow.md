@@ -38,7 +38,7 @@ flowchart TD
 ## 応答タスク
 
 1. メンション時は、同じチャンネルで動いている前の応答タスクを中止して新しいタスクを始めます。呼び出しユーザーのレート制限を確認し、拒否された場合は応答APIも圧縮APIも呼びません。
-2. レート制限を通過したユーザー起点要求では、共有履歴が `CONTEXT_COMPACTION_TOKEN_LIMIT` 以上かを確認し、超えていれば圧縮を別taskで開始します。通常応答は圧縮完了を待ちません。全要求のAPI入力には、同じ推定値でしきい値の75%以内に収まる直近turnを使います。system/developer instructionと最新turnは保持し、切り捨てた履歴は共有履歴に残します。
+2. レート制限を通過したユーザー起点要求では、共有履歴が `config.yaml` の `context_compaction_token_limit` 以上かを確認し、超えていれば圧縮を別taskで開始します。通常応答は圧縮完了を待ちません。全要求のAPI入力には、同じ推定値でしきい値の75%以内に収まる直近turnを使います。system/developer instructionと最新turnは保持し、切り捨てた履歴は共有履歴に残します。
 3. 見積りは各 `InputItem` をJSON化した文字列を `tiktoken-rs` の `o200k_base` で数え、画像1件ごとに1024 tokenを予約します。GPT-6用のtokenizer対応表がないためAPI実測値との一致は保証されず、system prompt・tool定義・画像コストにも差があります。保持したsystem/developer項目と最新turnだけで予算を超える場合は、それらを優先して残します。
 4. system prompt、チャンネル情報、要求種別の指示を加えてから、期限切れが近い画像URLをDiscordから更新します。元メッセージや添付が取得できない画像、および更新timeout時に未解決の画像は履歴から除いて続行します。
 5. 選択中のモデルでResponses APIをstreaming実行します。function toolが呼ばれたら実行結果を次のAPI roundへ渡し、最大10 roundまで続けます。Web SearchなどのAPI toolも同じ応答処理内で扱います。

@@ -35,28 +35,12 @@ impl Models {
     pub const CONTEXT_SUMMARY_MODEL: Self = Self::Gpt6Luna;
 
     pub fn list() -> Vec<Self> {
-        vec![
-            Self::Gpt5dot4Mini,
-            Self::Gpt5dot4Nano,
-            Self::Gpt5dot6Luna,
-            Self::Gpt5dot6Terra,
-            Self::Gpt6Luna,
-            Self::Gpt6Sol,
-            Self::Gpt6dot1Sol,
-            Self::O4Mini,
-        ]
+        vec![Self::Gpt6Luna]
     }
 
     pub fn from_name(value: &str) -> Option<Self> {
         match value {
-            "gpt-5.4-mini" => Some(Self::Gpt5dot4Mini),
-            "gpt-5.4-nano" => Some(Self::Gpt5dot4Nano),
-            "gpt-5.6-luna" => Some(Self::Gpt5dot6Luna),
-            "gpt-5.6-terra" => Some(Self::Gpt5dot6Terra),
             "gpt-6-luna" => Some(Self::Gpt6Luna),
-            "gpt-6-sol" => Some(Self::Gpt6Sol),
-            "gpt-6.1-sol" => Some(Self::Gpt6dot1Sol),
-            "o4-mini" => Some(Self::O4Mini),
             _ => None,
         }
     }

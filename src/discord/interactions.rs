@@ -6,7 +6,7 @@ use serenity::all::{
 
 use crate::{
     app::context::NelfieContext,
-    discord::{message_delivery::MODAL_PENDING_MESSAGE, responses::schedule_modal_response},
+    discord::responses::schedule_modal_response,
     llm::context::{LMContext, Role},
 };
 
@@ -69,16 +69,7 @@ pub(super) async fn handle_interaction(
                 }
             }
 
-            modal
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(MODAL_PENDING_MESSAGE)
-                            .ephemeral(true),
-                    ),
-                )
-                .await?;
+            modal.defer_ephemeral(&ctx.http).await?;
 
             let mut lm_context = LMContext::new();
             lm_context.add_text(

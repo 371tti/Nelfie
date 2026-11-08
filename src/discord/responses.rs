@@ -44,17 +44,31 @@ const IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS: &str = concat!(
     "\nImage generation workflow: Before generating or editing an image, call `model-control` ",
     "with target `image_generation` to read or set the selected model. The built-in ",
     "image_generation tool is enabled on the next API round using that selection. Do not ",
-    "request image generation in the same round as changing the image model."
+    "request image generation in the same round as changing the image model.\n",
+    "Attachment workflow: Use the `file` tool to list attachments in the current or another ",
+    "bot-visible channel, read supported UTF-8 text files, or attach Responses API-supported ",
+    "files to the next request. `get_user_profile` also registers its images as reusable file ",
+    "IDs in the current channel; use those IDs from `profile_images` as Typst assets. The file ",
+    "list contains IDs that remain available after history compaction. For a user-uploaded ",
+    "`.typ` file, pass its attachment ID directly as `source_attachment_id`; do not read or ",
+    "copy its contents into a tool argument.\n",
+    "Typst workflow: `typst-render` creates a draft and returns PNG page previews without ",
+    "posting. Each render has a distinct `draft_id`; inspect the matching ID on every page and ",
+    "any renderer warnings in the next request. If corrections are needed, render another draft. ",
+    "Call `typst-publish` with the exact `draft_id` you chose, only after that draft's preview ",
+    "was reviewed in an earlier response round and only when the user requested delivery. The ",
+    "default final format is PNG; use SVG or PDF only when explicitly requested. Never say the ",
+    "file was posted until `typst-publish` succeeds."
 );
 
-const RESPONSE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-const RESPONSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+const RESPONSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_RESPONSE_OUTPUT_TOKENS: u32 = 32_000;
 
-#[derive(Clone)]
 enum ProgressTarget {
     Public {
         channel_id: serenity::all::ChannelId,
-        message_id: serenity::all::MessageId,
+        message_id: Option<serenity::all::MessageId>,
     },
     Modal(ModalInteraction),
 }
@@ -64,8 +78,8 @@ impl ProgressTarget {
         matches!(self, Self::Public { .. })
     }
 
-    async fn edit(
-        &self,
+    async fn show(
+        &mut self,
         http: &serenity::http::Http,
         content: String,
     ) -> Result<(), serenity::Error> {
@@ -74,9 +88,16 @@ impl ProgressTarget {
                 channel_id,
                 message_id,
             } => {
-                channel_id
-                    .edit_message(http, *message_id, EditMessage::new().content(content))
-                    .await?;
+                if let Some(message_id) = message_id {
+                    channel_id
+                        .edit_message(http, *message_id, EditMessage::new().content(content))
+                        .await?;
+                } else {
+                    let message = channel_id
+                        .send_message(http, serenity::all::CreateMessage::new().content(content))
+                        .await?;
+                    *message_id = Some(message.id);
+                }
             }
             Self::Modal(interaction) => {
                 interaction
@@ -87,13 +108,16 @@ impl ProgressTarget {
         Ok(())
     }
 
-    async fn delete(&self, http: &serenity::http::Http) -> Result<(), serenity::Error> {
+    async fn delete(&mut self, http: &serenity::http::Http) -> Result<(), serenity::Error> {
         match self {
             Self::Public {
                 channel_id,
                 message_id,
             } => {
-                channel_id.delete_message(http, *message_id).await?;
+                if let Some(id) = *message_id {
+                    channel_id.delete_message(http, id).await?;
+                    *message_id = None;
+                }
             }
             Self::Modal(interaction) => interaction.delete_response(http).await?,
         }
@@ -103,8 +127,7 @@ impl ProgressTarget {
 
 fn render_progress(progress: &ResponseProgress) -> Option<String> {
     let content = match progress {
-        ResponseProgress::Preparing => "-# thinking...".to_string(),
-        ResponseProgress::Generating => "-# generating...".to_string(),
+        ResponseProgress::Preparing => return None,
         ResponseProgress::ToolRunning { tools } => tools
             .iter()
             .map(|tool| {
@@ -116,7 +139,6 @@ fn render_progress(progress: &ResponseProgress) -> Option<String> {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        ResponseProgress::Delivering => "-# sending response...".to_string(),
         ResponseProgress::Failed(content) => content.clone(),
         ResponseProgress::Completed | ResponseProgress::Canceled => return None,
     };
@@ -157,10 +179,10 @@ fn truncate_progress_content(content: &str, max_utf16_units: usize) -> String {
 
 async fn edit_progress_target(
     http: &serenity::http::Http,
-    target: &ProgressTarget,
+    target: &mut ProgressTarget,
     content: String,
 ) {
-    match timeout(RESPONSE_STATUS_TIMEOUT, target.edit(http, content)).await {
+    match timeout(RESPONSE_STATUS_TIMEOUT, target.show(http, content)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             warn!("failed to edit response progress: {error}");
@@ -171,7 +193,7 @@ async fn edit_progress_target(
     }
 }
 
-async fn delete_progress_target(http: &serenity::http::Http, target: &ProgressTarget) {
+async fn delete_progress_target(http: &serenity::http::Http, target: &mut ProgressTarget) {
     match timeout(RESPONSE_STATUS_TIMEOUT, target.delete(http)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("failed to delete response progress: {error}"),
@@ -182,13 +204,12 @@ async fn delete_progress_target(http: &serenity::http::Http, target: &ProgressTa
 async fn run_progress_controller(
     http: std::sync::Arc<serenity::http::Http>,
     channel_id: serenity::all::ChannelId,
-    target: ProgressTarget,
+    mut target: ProgressTarget,
     mut progress_rx: watch::Receiver<ResponseProgress>,
-    rendered_tx: watch::Sender<Option<ResponseProgress>>,
 ) {
     let public = target.is_public();
     let mut pending_edit = false;
-    let mut last_edit = Instant::now();
+    let mut last_edit = None;
     let mut edit_tick = interval(Duration::from_millis(550));
     edit_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     edit_tick.tick().await;
@@ -214,32 +235,32 @@ async fn run_progress_controller(
                 match progress {
                     ResponseProgress::Completed => {
                         if public {
-                            delete_progress_target(&http, &target).await;
+                            delete_progress_target(&http, &mut target).await;
                         }
                         break;
                     }
                     ResponseProgress::Failed(content) => {
-                        let failed = ResponseProgress::Failed(content);
-                        if let Some(content) = render_progress(&failed) {
-                            edit_progress_target(&http, &target, content).await;
-                        }
-                        rendered_tx.send_replace(Some(failed));
+                        edit_progress_target(&http, &mut target, content).await;
                         break;
                     }
                     ResponseProgress::Canceled => {
-                        delete_progress_target(&http, &target).await;
+                        delete_progress_target(&http, &mut target).await;
                         break;
                     }
                     progress => {
-                        if last_edit.elapsed() >= Duration::from_millis(550) {
-                            if let Some(content) = render_progress(&progress) {
-                                edit_progress_target(&http, &target, content).await;
-                                rendered_tx.send_replace(Some(progress.clone()));
-                                last_edit = Instant::now();
+                        if let Some(content) = render_progress(&progress) {
+                            if last_edit.map_or(true, |last: Instant| {
+                                last.elapsed() >= Duration::from_millis(550)
+                            }) {
+                                edit_progress_target(&http, &mut target, content).await;
+                                last_edit = Some(Instant::now());
+                                edit_tick.reset_after(Duration::from_millis(550));
+                                pending_edit = false;
+                            } else {
+                                pending_edit = true;
                             }
-                            pending_edit = false;
                         } else {
-                            pending_edit = true;
+                            pending_edit = false;
                         }
                     }
                 }
@@ -247,9 +268,9 @@ async fn run_progress_controller(
             _ = edit_tick.tick(), if pending_edit => {
                 let progress = progress_rx.borrow_and_update().clone();
                 if let Some(content) = render_progress(&progress) {
-                    edit_progress_target(&http, &target, content).await;
-                    rendered_tx.send_replace(Some(progress));
-                    last_edit = Instant::now();
+                    edit_progress_target(&http, &mut target, content).await;
+                    last_edit = Some(Instant::now());
+                    edit_tick.reset_after(Duration::from_millis(550));
                 }
                 pending_edit = false;
             }
@@ -280,29 +301,6 @@ async fn finish_progress(
     }
 }
 
-async fn wait_for_progress_rendered(
-    progress: &ResponseProgress,
-    rendered_rx: &mut watch::Receiver<Option<ResponseProgress>>,
-    cancel_rx: &mut watch::Receiver<bool>,
-) -> bool {
-    let deadline = TokioInstant::now() + RESPONSE_STATUS_TIMEOUT;
-    loop {
-        if rendered_rx.borrow().as_ref() == Some(progress) {
-            return true;
-        }
-        tokio::select! {
-            biased;
-            _ = wait_for_cancel(cancel_rx) => return false,
-            _ = tokio::time::sleep_until(deadline) => return true,
-            changed = rendered_rx.changed() => {
-                if changed.is_err() {
-                    return true;
-                }
-            }
-        }
-    }
-}
-
 fn response_failure_content(origin: &ResponseOrigin, reason: &str) -> String {
     let fallback = match reason {
         "reasoning error" => "-# Error during reasoning".to_string(),
@@ -312,39 +310,6 @@ fn response_failure_content(origin: &ResponseOrigin, reason: &str) -> String {
         _ => format!("-# Error {reason}"),
     };
     origin.failure_message(reason).unwrap_or(fallback)
-}
-
-async fn notify_response_failure(
-    ctx: &serenity::client::Context,
-    channel_id: serenity::all::ChannelId,
-    origin: &ResponseOrigin,
-    reason: &str,
-) {
-    let content = response_failure_content(origin, reason);
-
-    let result = if let Some(modal) = origin.modal_ephemeral_delivery() {
-        timeout(
-            RESPONSE_STATUS_TIMEOUT,
-            modal
-                .interaction
-                .edit_response(&ctx.http, EditInteractionResponse::new().content(content)),
-        )
-        .await
-        .map(|result| result.map(|_| ()))
-    } else {
-        timeout(
-            RESPONSE_STATUS_TIMEOUT,
-            channel_id.send_message(&ctx.http, CreateMessage::new().content(content)),
-        )
-        .await
-        .map(|result| result.map(|_| ()))
-    };
-
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!("failed to send response failure notice: {error}"),
-        Err(_) => warn!("timed out sending response failure notice"),
-    }
 }
 
 async fn deliver_response(
@@ -660,48 +625,24 @@ async fn run_response_task(
     let target = if let Some(modal) = origin.modal_ephemeral_delivery() {
         ProgressTarget::Modal(modal.interaction.clone())
     } else {
-        let initial_content = render_progress(&ResponseProgress::Preparing)
-            .expect("preparing progress always renders");
-        let message = match timeout(
-            RESPONSE_STATUS_TIMEOUT,
-            channel_id.send_message(&ctx.http, CreateMessage::new().content(initial_content)),
-        )
-        .await
-        {
-            Ok(Ok(message)) => message,
-            Ok(Err(error)) => {
-                notify_response_failure(ctx, channel_id, &origin, "reasoning error").await;
-                return Err(Box::new(error));
-            }
-            Err(_) => {
-                warn!(
-                    "timed out creating response progress: request_id={} channel={}",
-                    request_id,
-                    channel_id.get()
-                );
-                notify_response_failure(ctx, channel_id, &origin, "timeout").await;
-                return Ok(());
-            }
-        };
         ProgressTarget::Public {
-            channel_id: message.channel_id,
-            message_id: message.id,
+            channel_id,
+            message_id: None,
         }
     };
 
     if *cancel_rx.borrow() {
-        delete_progress_target(&ctx.http, &target).await;
+        let mut target = target;
+        delete_progress_target(&ctx.http, &mut target).await;
         return Ok(());
     }
 
     let (progress_sender, progress_rx) = watch::channel(ResponseProgress::Preparing);
-    let (rendered_tx, mut rendered_rx) = watch::channel(Some(ResponseProgress::Preparing));
     let progress_controller = tokio::spawn(run_progress_controller(
         ctx.http.clone(),
         channel_id,
         target,
         progress_rx,
-        rendered_tx,
     ));
 
     let preparation = tokio::select! {
@@ -800,12 +741,13 @@ async fn run_response_task(
     });
 
     let context_cache_key = format!("nelfie-context-{}", channel_id.get());
-    progress_sender.send_replace(ResponseProgress::Generating);
     let generate_response = ob_context.lm_client.generate_response(
         ob_context.clone(),
         &context,
         GenerateResponseOptions {
-            max_output_tokens: 2_000,
+            channel_id,
+            typst_drafts: std::sync::Arc::new(crate::typst_render::TypstDraftStore::default()),
+            max_output_tokens: MAX_RESPONSE_OUTPUT_TOKENS,
             tools,
             progress_sender: progress_sender.clone(),
             context_cache_key,
@@ -927,18 +869,6 @@ async fn run_response_task(
         "-# Reasoning done in {}ms, model: {}{}",
         elapsed, final_model, output_footer
     );
-    let delivering = ResponseProgress::Delivering;
-    progress_sender.send_replace(delivering.clone());
-    if !wait_for_progress_rendered(&delivering, &mut rendered_rx, &mut cancel_rx).await {
-        finish_progress(
-            &progress_sender,
-            progress_controller,
-            ResponseProgress::Canceled,
-        )
-        .await;
-        return Ok(());
-    }
-
     let delivery_result = {
         let delivery = deliver_response(
             &ctx.http,
@@ -1062,14 +992,7 @@ mod tests {
 
     #[test]
     fn progress_states_render_with_one_simple_prefix() {
-        assert_eq!(
-            render_progress(&ResponseProgress::Preparing).as_deref(),
-            Some("-# thinking...")
-        );
-        assert_eq!(
-            render_progress(&ResponseProgress::Generating).as_deref(),
-            Some("-# generating...")
-        );
+        assert_eq!(render_progress(&ResponseProgress::Preparing), None);
         assert_eq!(
             render_progress(&ResponseProgress::ToolRunning {
                 tools: vec![
@@ -1086,11 +1009,8 @@ mod tests {
             .as_deref(),
             Some("-# web search: searching the web...\n-# discord: sending a Discord message")
         );
-        assert_eq!(
-            render_progress(&ResponseProgress::Delivering).as_deref(),
-            Some("-# sending response...")
-        );
         assert_eq!(render_progress(&ResponseProgress::Canceled), None);
+        assert_eq!(render_progress(&ResponseProgress::Completed), None);
     }
 
     #[test]
@@ -1112,7 +1032,6 @@ mod tests {
     #[tokio::test]
     async fn progress_watch_keeps_only_the_latest_state() {
         let (sender, mut receiver) = watch::channel(ResponseProgress::Preparing);
-        sender.send_replace(ResponseProgress::Generating);
         sender.send_replace(ResponseProgress::ToolRunning {
             tools: vec![ToolProgress {
                 label: "web search".to_string(),

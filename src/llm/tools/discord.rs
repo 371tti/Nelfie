@@ -1,9 +1,17 @@
-use std::str::FromStr;
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
+use async_openai::types::responses::{
+    EasyInputContent, EasyInputMessage, ImageDetail, InputContent, InputImageContent, InputItem,
+    InputTextContent, Role as InputRole,
+};
 use serde_json::json;
 use serenity::all::{
     Builder, ChannelId, ChannelType, CreateMessage, CreateThread, EditInteractionResponse,
-    EditMessage, GetMessages, GuildChannel, GuildId, Message, MessageId, ReactionType, UserId,
+    EditMessage, GetMessages, GuildChannel, GuildId, Message, MessageId, OnlineStatus, ReactionType,
+    RoleId, UserId,
 };
 use serenity::model::guild::Guild;
 
@@ -25,9 +33,545 @@ impl DiscordTool {
         args.get(key).and_then(|v| v.as_bool())
     }
 
+    fn profile_image_file_metadata(user_id: UserId, label: &str, url: &str) -> (String, String) {
+        let extension = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| {
+                url.path()
+                    .rsplit('/')
+                    .next()
+                    .and_then(|filename| filename.rsplit_once('.').map(|(_, ext)| ext))
+                    .map(str::to_ascii_lowercase)
+            })
+            .filter(|extension| {
+                matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif")
+            })
+            .unwrap_or_else(|| "png".to_string());
+        let content_type = match extension.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "image/png",
+        };
+        let label = label
+            .to_ascii_lowercase()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        (
+            format!("user-{}-{label}.{extension}", user_id.get()),
+            content_type.to_string(),
+        )
+    }
+
     fn parse_guild_id(args: &serde_json::Value) -> Result<GuildId, String> {
         let guild_id_str = get_str_arg(args, "guild_id")?;
         GuildId::from_str(guild_id_str).map_err(|e| format!("Invalid 'guild_id': {e}"))
+    }
+
+    fn current_guild_id(
+        cache: &serenity::cache::Cache,
+        channel_id: Option<ChannelId>,
+    ) -> Option<GuildId> {
+        channel_id.and_then(|channel_id| cache.channel(channel_id).map(|channel| channel.guild_id))
+    }
+
+    fn resolve_guild_id(
+        args: &serde_json::Value,
+        cache: &serenity::cache::Cache,
+        current_channel_id: Option<ChannelId>,
+    ) -> Result<GuildId, String> {
+        if let Some(guild_id) = get_opt_str_arg(args, "guild_id") {
+            return GuildId::from_str(guild_id)
+                .map_err(|error| format!("Invalid 'guild_id': {error}"));
+        }
+
+        Self::current_guild_id(cache, current_channel_id)
+            .ok_or_else(|| {
+                "A guild_id is required when the current channel is not in a server.".to_string()
+            })
+    }
+
+    async fn user_profile_result(
+        args: &serde_json::Value,
+        ob_ctx: &crate::app::context::NelfieContext,
+        current_channel_id: Option<ChannelId>,
+    ) -> Result<crate::llm::tool::ToolExecutionResult, String> {
+        let discord = ob_ctx.discord_client.open();
+        let http = discord.http.clone();
+        let cache = discord.cache.clone();
+        let explicit_guild_id = get_opt_str_arg(args, "guild_id")
+            .map(|value| {
+                GuildId::from_str(value).map_err(|error| format!("Invalid 'guild_id': {error}"))
+            })
+            .transpose()?;
+        let guild_id_was_explicit = explicit_guild_id.is_some();
+        let guild_id = explicit_guild_id
+            .or_else(|| Self::current_guild_id(&cache, current_channel_id));
+        let user_id = match get_opt_str_arg(args, "user_id") {
+            Some(user_id) => {
+                if get_opt_str_arg(args, "username").is_some() {
+                    return Err("Specify either 'user_id' or 'username', not both.".to_string());
+                }
+                UserId::from_str(user_id)
+                    .map_err(|error| format!("Invalid 'user_id': {error}"))?
+            }
+            None => {
+                let username = get_str_arg(args, "username")?;
+                let guild_id = guild_id.ok_or_else(|| {
+                    "Username lookup requires a server context or an explicit 'guild_id'."
+                        .to_string()
+                })?;
+                let matches = guild_id
+                    .search_members(&http, username, Some(100))
+                    .await
+                    .map_err(|error| format!("Failed to search Discord members: {error}"))?;
+                let exact_matches = matches
+                    .iter()
+                    .filter(|member| {
+                        member.user.name.eq_ignore_ascii_case(username)
+                            || member
+                                .user
+                                .global_name
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(username))
+                            || member
+                                .nick
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(username))
+                    })
+                    .collect::<Vec<_>>();
+
+                let selected = if exact_matches.len() == 1 {
+                    Some(exact_matches[0])
+                } else if exact_matches.is_empty() && matches.len() == 1 {
+                    matches.first()
+                } else {
+                    None
+                };
+                if let Some(member) = selected {
+                    member.user.id
+                } else {
+                    let candidates = matches
+                        .iter()
+                        .map(|member| {
+                            format!(
+                                "{} (username={}, display_name={})",
+                                member.user.id,
+                                member.user.name,
+                                member.display_name()
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if candidates.is_empty() {
+                        return Err(format!(
+                            "No server member matched username or nickname prefix '{username}'."
+                        ));
+                    }
+                    return Err(format!(
+                        "Username '{username}' is ambiguous. Matching server members: {}",
+                        candidates.join(", ")
+                    ));
+                }
+            }
+        };
+        let user = http
+            .get_user(user_id)
+            .await
+            .map_err(|error| format!("Failed to fetch Discord user profile: {error}"))?;
+
+        let avatar_url = user.face();
+        let banner_url = user.banner_url();
+        let avatar_decoration_url = user
+            .avatar_decoration_data
+            .as_ref()
+            .map(|decoration| decoration.decoration_url());
+        let accent_color = user
+            .accent_colour
+            .map(|color| format!("#{:06X}", color.0 & 0x00FF_FFFF));
+
+        let mut image_urls = vec![("avatar".to_string(), avatar_url.clone())];
+        if let Some(url) = banner_url.as_ref() {
+            image_urls.push(("banner".to_string(), url.clone()));
+        }
+        if let Some(url) = avatar_decoration_url.as_ref() {
+            image_urls.push(("avatar decoration".to_string(), url.clone()));
+        }
+
+        let guild_profile = if let Some(guild_id) = guild_id {
+            match guild_id.member(&http, user_id).await {
+                Ok(member) => {
+                    let guild_avatar_url = member.avatar_url();
+                    let guild_banner_url = member.banner_url();
+                    let guild_decoration_url = member
+                        .avatar_decoration_data
+                        .as_ref()
+                        .map(|decoration| decoration.decoration_url());
+
+                    for (label, url) in [
+                        ("server avatar", guild_avatar_url.as_ref()),
+                        ("server banner", guild_banner_url.as_ref()),
+                        ("server avatar decoration", guild_decoration_url.as_ref()),
+                    ] {
+                        if let Some(url) = url
+                            && !image_urls.iter().any(|(_, existing)| existing == url)
+                        {
+                            image_urls.push((label.to_string(), url.clone()));
+                        }
+                    }
+
+                    Some(json!({
+                        "guild_id": guild_id.to_string(),
+                        "nickname": member.nick,
+                        "display_name": member.display_name(),
+                        "joined_at": member.joined_at.as_ref().map(ToString::to_string),
+                        "role_ids": member.roles.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        "avatar_url": guild_avatar_url,
+                        "banner_url": guild_banner_url,
+                        "avatar_decoration_url": guild_decoration_url,
+                    }))
+                }
+                Err(error) if guild_id_was_explicit => {
+                    return Err(format!("Failed to fetch Discord guild member: {error}"));
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let profile_image_refs = if let Some(channel_id) = current_channel_id {
+            image_urls
+                .iter()
+                .map(|(label, url)| {
+                    let (filename, content_type) =
+                        Self::profile_image_file_metadata(user_id, label, url);
+                    ob_ctx.attachment_registry.register_profile_image(
+                        channel_id,
+                        filename,
+                        content_type,
+                        url.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+
+        let profile = json!({
+            "status": "ok",
+            "operation": "get_user_profile",
+            "user_id": user_id.to_string(),
+            "username": user.name,
+            "global_name": user.global_name,
+            "discriminator": user.discriminator.map(|value| value.get()),
+            "bot": user.bot,
+            "system": user.system,
+            "created_at": user.created_at().to_string(),
+            "avatar_url": avatar_url,
+            "banner_url": banner_url,
+            "accent_color": accent_color,
+            "avatar_decoration_url": avatar_decoration_url,
+            "profile_url": format!("https://discord.com/users/{user_id}"),
+            "guild_profile": guild_profile,
+            "profile_images": profile_image_refs.iter().map(|reference| reference.to_json()).collect::<Vec<_>>(),
+        });
+
+        let mut content = Vec::with_capacity(image_urls.len() * 2);
+        for (index, (label, url)) in image_urls.into_iter().enumerate() {
+            let reusable_asset = profile_image_refs.get(index).map(|reference| {
+                format!(
+                    "Reusable file and Typst asset ID: {} ({})",
+                    reference.attachment_id, reference.filename
+                )
+            });
+            content.push(InputContent::InputText(InputTextContent {
+                text: reusable_asset.map_or_else(
+                    || format!("Discord profile image for user {user_id}: {label}"),
+                    |asset| format!("Discord profile image for user {user_id}: {label}. {asset}"),
+                ),
+            }));
+            content.push(InputContent::InputImage(InputImageContent {
+                detail: ImageDetail::Auto,
+                file_id: None,
+                image_url: Some(url),
+            }));
+        }
+
+        Ok(crate::llm::tool::ToolExecutionResult {
+            text: profile.to_string(),
+            input_items: vec![InputItem::EasyMessage(EasyInputMessage {
+                role: InputRole::User,
+                content: EasyInputContent::ContentList(content),
+                ..Default::default()
+            })],
+            input_bytes: 0,
+            review_preview_id: None,
+        })
+    }
+
+    async fn list_recent_users_result(
+        args: &serde_json::Value,
+        ob_ctx: &crate::app::context::NelfieContext,
+        current_channel_id: Option<ChannelId>,
+    ) -> Result<String, String> {
+        let discord = ob_ctx.discord_client.open();
+        let http = discord.http.clone();
+        let cache = discord.cache.clone();
+        let channel_id = match get_opt_str_arg(args, "channel_id") {
+            Some(channel_id) => ChannelId::from_str(channel_id)
+                .map_err(|error| format!("Invalid 'channel_id': {error}"))?,
+            None => current_channel_id.ok_or_else(|| {
+                "A channel_id is required when there is no current channel context.".to_string()
+            })?,
+        };
+        let limit = args
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(50)
+            .clamp(1, 100) as u8;
+        let include_bots = Self::get_opt_bool_arg(args, "include_bots").unwrap_or(false);
+        let presence_by_user = Self::current_guild_id(&cache, Some(channel_id))
+            .and_then(|guild_id| cache.guild(guild_id))
+            .map(|guild| {
+                guild
+                    .presences
+                    .iter()
+                    .map(|(user_id, presence)| (*user_id, presence.status))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        let messages = channel_id
+            .messages(&http, GetMessages::new().limit(limit))
+            .await
+            .map_err(|error| format!("Failed to fetch recent channel messages: {error}"))?;
+        let scanned_message_count = messages.len();
+
+        let mut positions = HashMap::<UserId, usize>::new();
+        let mut users = Vec::<serde_json::Value>::new();
+        for message in messages {
+            if !include_bots && message.author.bot {
+                continue;
+            }
+
+            if let Some(index) = positions.get(&message.author.id).copied() {
+                let message_count = users[index]["message_count"].as_u64().unwrap_or(1);
+                users[index]["message_count"] = json!(message_count + 1);
+                continue;
+            }
+
+            let display_name = message
+                .member
+                .as_ref()
+                .and_then(|member| member.nick.as_deref())
+                .unwrap_or_else(|| message.author.display_name())
+                .to_string();
+            let status = presence_by_user
+                .get(&message.author.id)
+                .map(|status| status.name())
+                .unwrap_or("unknown");
+            positions.insert(message.author.id, users.len());
+            users.push(json!({
+                "user_id": message.author.id.to_string(),
+                "username": message.author.name,
+                "global_name": message.author.global_name,
+                "display_name": display_name,
+                "bot": message.author.bot,
+                "online_status": status,
+                "last_message_id": message.id.to_string(),
+                "last_message_at": message.timestamp.to_string(),
+                "message_count": 1,
+            }));
+        }
+
+        Ok(json!({
+            "status": "ok",
+            "operation": "list_recent_users",
+            "channel_id": channel_id.to_string(),
+            "scanned_message_count": scanned_message_count,
+            "include_bots": include_bots,
+            "user_count": users.len(),
+            "users": users,
+        })
+        .to_string())
+    }
+
+    async fn search_users_result(
+        args: &serde_json::Value,
+        ob_ctx: &crate::app::context::NelfieContext,
+        current_channel_id: Option<ChannelId>,
+    ) -> Result<String, String> {
+        let query = get_str_arg(args, "query")?.trim();
+        if query.is_empty() {
+            return Err("The 'query' parameter must not be empty.".to_string());
+        }
+
+        let discord = ob_ctx.discord_client.open();
+        let http = discord.http.clone();
+        let cache = discord.cache.clone();
+        let guild_id = Self::resolve_guild_id(args, &cache, current_channel_id)?;
+        let limit = args
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(25)
+            .clamp(1, 100) as usize;
+        let include_bots = Self::get_opt_bool_arg(args, "include_bots").unwrap_or(false);
+        let online_only = Self::get_opt_bool_arg(args, "online_only").unwrap_or(false);
+        if online_only && !ob_ctx.config.discord_presence_intent_enabled {
+            return Err(
+                "Online filtering is disabled. Set DISCORD_PRESENCE_INTENT_ENABLED=true and enable the GUILD_PRESENCES privileged intent in the Discord Developer Portal, then restart Nelfie."
+                    .to_string(),
+            );
+        }
+
+        let role_id = get_opt_str_arg(args, "role_id")
+            .map(|value| {
+                RoleId::from_str(value).map_err(|error| format!("Invalid 'role_id': {error}"))
+            })
+            .transpose()?;
+        let channel_id = get_opt_str_arg(args, "channel_id")
+            .map(|value| {
+                ChannelId::from_str(value)
+                    .map_err(|error| format!("Invalid 'channel_id': {error}"))
+            })
+            .transpose()?;
+        let activity_limit = args
+            .get("activity_limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 100) as u8;
+
+        let (presence_by_user, channel_type, voice_user_ids) = {
+            let guild = cache.guild(guild_id).ok_or_else(|| {
+                "Guild is not available in cache. Make sure Nelfie has joined the server and finished connecting.".to_string()
+            })?;
+            let presence_by_user = guild
+                .presences
+                .iter()
+                .map(|(user_id, presence)| (*user_id, presence.status))
+                .collect::<HashMap<_, _>>();
+            let channel_type = channel_id
+                .and_then(|channel_id| guild.channels.get(&channel_id).map(|channel| channel.kind));
+            let voice_user_ids = if channel_type.is_some_and(Self::is_voice_channel_type) {
+                guild
+                    .voice_states
+                    .iter()
+                    .filter(|(_, state)| state.channel_id == channel_id)
+                    .map(|(user_id, _)| *user_id)
+                    .collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            };
+            (presence_by_user, channel_type, voice_user_ids)
+        };
+
+        let channel_user_ids = if let Some(channel_id) = channel_id {
+            if channel_type.is_some_and(Self::is_voice_channel_type) {
+                Some(voice_user_ids)
+            } else {
+                let messages = channel_id
+                    .messages(&http, GetMessages::new().limit(activity_limit))
+                    .await
+                    .map_err(|error| {
+                        format!("Failed to fetch recent messages for channel filter: {error}")
+                    })?;
+                Some(
+                    messages
+                        .into_iter()
+                        .map(|message| message.author.id)
+                        .collect::<HashSet<_>>(),
+                )
+            }
+        } else {
+            None
+        };
+
+        let remote_limit = if online_only || role_id.is_some() || channel_id.is_some() {
+            1000
+        } else {
+            limit as u64
+        };
+        let members = guild_id
+            .search_members(&http, query, Some(remote_limit))
+            .await
+            .map_err(|error| format!("Failed to search server members: {error}"))?;
+
+        let mut users = Vec::new();
+        for member in members {
+            let user_id = member.user.id;
+            if !include_bots && member.user.bot {
+                continue;
+            }
+            if role_id.is_some_and(|role_id| !member.roles.contains(&role_id)) {
+                continue;
+            }
+            if channel_user_ids
+                .as_ref()
+                .is_some_and(|user_ids| !user_ids.contains(&user_id))
+            {
+                continue;
+            }
+
+            let status = presence_by_user.get(&user_id).copied();
+            let is_online = status.is_some_and(|status| {
+                matches!(
+                    status,
+                    OnlineStatus::Online | OnlineStatus::Idle | OnlineStatus::DoNotDisturb
+                )
+            });
+            if online_only && !is_online {
+                continue;
+            }
+
+            users.push(json!({
+                "user_id": user_id.to_string(),
+                "username": member.user.name,
+                "global_name": member.user.global_name,
+                "nickname": member.nick,
+                "display_name": member.display_name(),
+                "bot": member.user.bot,
+                "online_status": status
+                    .map(|status| status.name().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                "joined_at": member.joined_at.as_ref().map(ToString::to_string),
+                "role_ids": member.roles.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "avatar_url": member.avatar_url().unwrap_or_else(|| member.user.face()),
+            }));
+            if users.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(json!({
+            "status": "ok",
+            "operation": "search_users",
+            "guild_id": guild_id.to_string(),
+            "query": query,
+            "match_type": "username_or_nickname_prefix",
+            "filters": {
+                "online_only": online_only,
+                "role_id": role_id.map(|role_id| role_id.to_string()),
+                "channel_id": channel_id.map(|channel_id| channel_id.to_string()),
+                "activity_limit": if channel_user_ids.is_some()
+                    && !channel_type.is_some_and(Self::is_voice_channel_type)
+                {
+                    Some(activity_limit)
+                } else {
+                    None
+                },
+                "include_bots": include_bots,
+            },
+            "user_count": users.len(),
+            "users": users,
+        })
+        .to_string())
     }
 
     fn channel_matches_filter(channel_type: ChannelType, channel_filter: &str) -> bool {
@@ -140,7 +684,7 @@ impl LMTool for DiscordTool {
     }
 
     fn description(&self) -> String {
-        "Interact with Discord: add/remove reactions, create threads, send/edit/fetch/search messages, send ephemeral interaction messages visible only to the current modal respondent, and inspect channels/voice presence. Important: when you use send_message or send_ephemeral_message, the text is already posted to Discord, so do not repeat the same body again in a normal assistant reply.".to_string()
+        "Interact with Discord: inspect user profiles and profile images, search server members by username or nickname with online, role, and channel filters, list recent users in a channel, add/remove reactions, create threads, send/edit/fetch/search messages, send ephemeral interaction messages visible only to the current modal respondent, and inspect channels/voice presence. get_user_profile returns reusable file and Typst asset IDs for its images. Use get_user_profile with a user_id or username, search_users for server-member queries, and list_recent_users for recent channel participants. Important: when you use send_message or send_ephemeral_message, the text is already posted to Discord, so do not repeat the same body again in a normal assistant reply.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -161,20 +705,27 @@ impl LMTool for DiscordTool {
                         "search_messages",
                         "list_channels",
                         "list_voice_channels",
-                        "list_voice_members"
+                        "list_voice_members",
+                        "get_user_profile",
+                        "search_users",
+                        "list_recent_users"
                     ]
                 },
                 "guild_id": {
                     "type": "string",
-                    "description": "ID of the target guild. Required for: list_channels, list_voice_channels, list_voice_members."
+                    "description": "ID of the target guild. Required for: list_channels, list_voice_channels, list_voice_members. Optional for search_users and username-based get_user_profile; defaults to the current server when possible."
                 },
                 "channel_id": {
                     "type": "string",
-                    "description": "ID of the target channel. Required for message/reaction/thread operations. Optional filter for list_voice_members."
+                    "description": "ID of the target channel. Required for message/reaction/thread operations. Optional for list_recent_users (defaults to the current channel) and search_users; search_users matches recent text-channel speakers or current voice/stage participants."
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "ID of the target user. Optional for send_ephemeral_message; if provided, it must match the current modal respondent. Discord only permits this operation while handling an interaction such as a modal submission."
+                    "description": "ID of the target user. Use for get_user_profile; it may be omitted when username is provided. Optional for send_ephemeral_message; if provided, it must match the current modal respondent. Discord only permits this operation while handling an interaction such as a modal submission."
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Username or server nickname to look up with get_user_profile. Requires a server context or guild_id. A unique prefix match is accepted; ambiguous matches return candidates. Global display names are returned in results but Discord member search does not search them directly."
                 },
                 "message_id": {
                     "type": "string",
@@ -203,11 +754,27 @@ impl LMTool for DiscordTool {
                 },
                 "query": {
                     "type": "string",
-                    "description": "Keyword to search in message content. Used by: search_messages."
+                    "description": "Search text. Used as a content substring by search_messages, or as a username/nickname prefix by search_users."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max number of recent messages to scan (1–100). Defaults to 50. Used by: search_messages."
+                    "description": "Result limit. For search_messages and list_recent_users, max messages to scan (1–100, default 50); for search_users, max users to return (1–100, default 25)."
+                },
+                "online_only": {
+                    "type": "boolean",
+                    "description": "When true, search_users returns only users whose cached Discord presence is online, idle, or do-not-disturb. Requires GUILD_PRESENCES to be enabled."
+                },
+                "role_id": {
+                    "type": "string",
+                    "description": "Optional server role ID filter for search_users."
+                },
+                "include_bots": {
+                    "type": "boolean",
+                    "description": "Whether list_recent_users and search_users should include bot users. Defaults to false."
+                },
+                "activity_limit": {
+                    "type": "integer",
+                    "description": "How many recent messages to scan when search_users filters by a text channel (1–100, default 100)."
                 },
                 "channel_type": {
                     "type": "string",
@@ -237,6 +804,14 @@ impl LMTool for DiscordTool {
         let cache = ob_ctx.discord_client.open().cache.clone();
 
         match operation {
+            "get_user_profile" => {
+                Ok(Self::user_profile_result(&args, &ob_ctx, None).await?.text)
+            }
+            "search_users" => Ok(Self::search_users_result(&args, &ob_ctx, None).await?),
+            "list_recent_users" => {
+                Ok(Self::list_recent_users_result(&args, &ob_ctx, None).await?)
+            }
+
             // --------------------
             // Reaction: add
             // --------------------
@@ -709,8 +1284,37 @@ impl LMTool for DiscordTool {
                 "Unsupported 'operation': {other}. \
                  Use one of: add_reaction, remove_reaction, create_thread, \
                  send_message, send_ephemeral_message, edit_message, fetch_message, search_messages, \
-                 list_channels, list_voice_channels, list_voice_members."
+                 list_channels, list_voice_channels, list_voice_members, get_user_profile, \
+                 search_users, list_recent_users."
             )),
         }
+    }
+
+    async fn execute_with_context_result(
+        &self,
+        args: serde_json::Value,
+        ob_ctx: crate::app::context::NelfieContext,
+        context: crate::llm::tool::ToolExecutionContext,
+    ) -> Result<crate::llm::tool::ToolExecutionResult, String> {
+        match args.get("operation").and_then(|value| value.as_str()) {
+            Some("get_user_profile") => {
+                return Self::user_profile_result(&args, &ob_ctx, Some(context.channel_id)).await;
+            }
+            Some("search_users") => {
+                return Self::search_users_result(&args, &ob_ctx, Some(context.channel_id))
+                    .await
+                    .map(crate::llm::tool::ToolExecutionResult::text);
+            }
+            Some("list_recent_users") => {
+                return Self::list_recent_users_result(&args, &ob_ctx, Some(context.channel_id))
+                    .await
+                    .map(crate::llm::tool::ToolExecutionResult::text);
+            }
+            _ => {}
+        }
+
+        self.execute(args, ob_ctx)
+            .await
+            .map(crate::llm::tool::ToolExecutionResult::text)
     }
 }

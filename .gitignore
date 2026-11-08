@@ -1,5 +1,6 @@
 /target
 .env
+config.yaml
 config.json
 /data
 /voicevox_core

@@ -6,9 +6,9 @@ use async_openai::{
     error::OpenAIError,
     types::responses::{
         CreateResponseArgs, FunctionCallOutput, FunctionCallOutputItemParam, ImageGenTool,
-        ImageGenToolOutputFormat, InputItem, Item, MessageItem, OutputItem, OutputMessageContent,
-        PromptCacheRetention, Reasoning, ResponseStreamEvent, Status, Tool, ToolChoiceOptions,
-        ToolChoiceParam, WebSearchTool, WebSearchToolCallAction,
+        ImageGenToolOutputFormat, InputItem, InputParam, Item, MessageItem, OutputItem,
+        OutputMessageContent, PromptCacheRetention, Reasoning, ResponseStreamEvent, Status, Tool,
+        ToolChoiceOptions, ToolChoiceParam, WebSearchTool, WebSearchToolCallAction,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -31,6 +31,8 @@ pub struct LMClient {
 }
 
 pub struct GenerateResponseOptions {
+    pub channel_id: serenity::all::ChannelId,
+    pub typst_drafts: Arc<crate::typst_render::TypstDraftStore>,
     pub max_output_tokens: u32,
     pub tools: Arc<HashMap<String, Box<dyn LMTool>>>,
     pub progress_sender: watch::Sender<ResponseProgress>,
@@ -51,9 +53,7 @@ pub struct GenerateResponseResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResponseProgress {
     Preparing,
-    Generating,
     ToolRunning { tools: Vec<ToolProgress> },
-    Delivering,
     Completed,
     Failed(String),
     Canceled,
@@ -154,6 +154,8 @@ impl LMClient {
         );
 
         let GenerateResponseOptions {
+            channel_id,
+            typst_drafts,
             max_output_tokens,
             tools,
             progress_sender,
@@ -181,6 +183,8 @@ impl LMClient {
         let mut image_generation_enabled = false;
         let mut generated_images = Vec::new();
         let mut final_model = initial_model;
+        let mut next_request_items = Vec::<InputItem>::new();
+        let mut next_request_file_bytes = 0usize;
 
         for round in 0..MAX_RESPONSE_ROUNDS {
             let current_model = if allow_mainline_model_change {
@@ -193,17 +197,26 @@ impl LMClient {
             };
             final_model = current_model;
             let request_parameters = current_model.to_parameter();
-            let context = lm_context.generate_context_with(&delta_context);
+            let mut context = lm_context.generate_context_with(&delta_context);
+            if !next_request_items.is_empty() {
+                if let InputParam::Items(items) = &mut context {
+                    items.append(&mut next_request_items);
+                }
+                next_request_file_bytes = 0;
+            }
             debug!("Responses round {}: generated context", round + 1);
 
             let tool_context = ToolExecutionContext {
+                channel_id,
                 user_context_scope,
                 allow_mainline_model_change,
                 image_generation_enabled,
+                response_round: round,
+                typst_drafts: typst_drafts.clone(),
             };
             let mut tool_defs = tools
                 .values()
-                .map(|tool| tool.define_for_request(tool_context))
+                .map(|tool| tool.define_for_request(tool_context.clone()))
                 .collect::<Vec<Tool>>();
             add_explain_parameter(&mut tool_defs);
             tool_defs.push(Tool::WebSearch(WebSearchTool::default()));
@@ -253,13 +266,6 @@ impl LMClient {
                             );
                         }
 
-                        if should_ignore_stream_deserialize_error(&err) {
-                            debug!(
-                                "Ignored known web_search_call stream schema mismatch: {}",
-                                err
-                            );
-                            continue;
-                        }
                         return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
                     }
                 };
@@ -356,7 +362,7 @@ impl LMClient {
                         OutputItem::WebSearchCall(web_search_tool_call) => {
                             progress_send(tool_running(
                                 "web search",
-                                web_search_explanation(&web_search_tool_call.action),
+                                web_search_explanation(web_search_tool_call.action.as_ref()),
                             ));
                             response_output_items.push((
                                 e.output_index,
@@ -390,9 +396,8 @@ impl LMClient {
                                 InputItem::Item(Item::ImageGenerationCall(image_call)),
                             ));
                         }
-                        other => {
+                        _ => {
                             warn!("Ignoring unsupported OpenAI output item");
-                            debug!("Unsupported OpenAI output item: {:?}", other);
                         }
                     },
 
@@ -411,9 +416,7 @@ impl LMClient {
                         ))));
                     }
 
-                    other => {
-                        debug!("Unhandled stream event: {:?}", other);
-                    }
+                    _ => debug!("Ignoring an unhandled Responses API stream event"),
                 }
             }
 
@@ -455,8 +458,8 @@ impl LMClient {
             for (tool_index, (tool_call, name, v_args, _)) in
                 prepared_tool_calls.into_iter().enumerate()
             {
-                debug!("Executing tool call: {:?}", tool_call);
                 let call_id = tool_call.call_id.clone();
+                debug!("Executing tool {name} (call {call_id})");
 
                 if let Some(tool) = tools.get(&name) {
                     let is_model_control = name == "model-control";
@@ -469,7 +472,7 @@ impl LMClient {
                         .and_then(serde_json::Value::as_str)
                         .map(ToOwned::to_owned);
                     let exec_result = tool
-                        .execute_with_context(v_args, ob_ctx.clone(), tool_context)
+                        .execute_with_context_result(v_args, ob_ctx.clone(), tool_context.clone())
                         .await;
                     let reads_both_model_selections =
                         action.as_deref() == Some("get") && target.is_none();
@@ -487,21 +490,54 @@ impl LMClient {
                     {
                         mainline_model_change_requested = true;
                     }
-                    debug!("Tool {} executed with result: {:?}", name, exec_result);
-
                     let output = match exec_result {
-                        Ok(res) => FunctionCallOutputItemParam {
-                            call_id: call_id.clone(),
-                            output: FunctionCallOutput::Text(res),
-                            id: None,
-                            status: None,
-                        },
-                        Err(err) => FunctionCallOutputItemParam {
-                            call_id: call_id.clone(),
-                            output: FunctionCallOutput::Text(format!("Error: {}", err)),
-                            id: None,
-                            status: None,
-                        },
+                        Ok(result) => {
+                            let text = if !result.input_items.is_empty() {
+                                if result.input_bytes > 0
+                                    && next_request_file_bytes.saturating_add(result.input_bytes)
+                                    > 50 * 1024 * 1024
+                                {
+                                    warn!(
+                                        "Tool {} output rejected: request attachment limit exceeded",
+                                        name
+                                    );
+                                    "Error: 添付ファイルの合計は1リクエストあたり50 MiBまでです。"
+                                        .to_string()
+                                } else {
+                                    debug!(
+                                        "Tool {} attached {} input item(s), {} bytes",
+                                        name,
+                                        result.input_items.len(),
+                                        result.input_bytes
+                                    );
+                                    next_request_file_bytes = next_request_file_bytes
+                                        .saturating_add(result.input_bytes);
+                                    next_request_items.extend(result.input_items);
+                                    if let Some(draft_id) = result.review_preview_id.as_deref() {
+                                        typst_drafts.mark_preview_delivered(draft_id, round);
+                                    }
+                                    result.text
+                                }
+                            } else {
+                                debug!("Tool {} completed ({} chars)", name, result.text.len());
+                                result.text
+                            };
+                            FunctionCallOutputItemParam {
+                                call_id: call_id.clone(),
+                                output: FunctionCallOutput::Text(text),
+                                id: None,
+                                status: None,
+                            }
+                        }
+                        Err(error) => {
+                            debug!("Tool {} failed: {}", name, error);
+                            FunctionCallOutputItemParam {
+                                call_id: call_id.clone(),
+                                output: FunctionCallOutput::Text(format!("Error: {error}")),
+                                id: None,
+                                status: None,
+                            }
+                        }
                     };
 
                     outputs.push(output);
@@ -512,9 +548,7 @@ impl LMClient {
                     .skip(tool_index + 1)
                     .cloned()
                     .collect::<Vec<_>>();
-                if remaining_tools.is_empty() {
-                    progress_send(ResponseProgress::Generating);
-                } else {
+                if !remaining_tools.is_empty() {
                     progress_send(ResponseProgress::ToolRunning {
                         tools: remaining_tools,
                     });
@@ -665,7 +699,6 @@ fn add_explain_parameter(tools: &mut [Tool]) {
 
 fn response_progress_for_event(event: &ResponseStreamEvent) -> Option<ResponseProgress> {
     match event {
-        ResponseStreamEvent::ResponseOutputTextDelta(_) => Some(ResponseProgress::Generating),
         ResponseStreamEvent::ResponseImageGenerationCallInProgress(_)
         | ResponseStreamEvent::ResponseImageGenerationCallGenerating(_) => {
             Some(tool_running("image generation", "creating an image..."))
@@ -733,7 +766,11 @@ fn take_tool_explanation(name: &str, arguments: &mut serde_json::Value) -> Strin
         .unwrap_or_else(|| fallback_tool_explanation(name, arguments))
 }
 
-fn web_search_explanation(action: &WebSearchToolCallAction) -> String {
+fn web_search_explanation(action: Option<&WebSearchToolCallAction>) -> String {
+    let Some(action) = action else {
+        return "searching the web...".to_string();
+    };
+
     match action {
         WebSearchToolCallAction::Search(search) if !search.query.trim().is_empty() => {
             search.query.trim().to_string()
@@ -811,22 +848,9 @@ fn stream_error_from_deserialize_error(err: &OpenAIError) -> Option<io::Error> {
     )))
 }
 
-fn should_ignore_stream_deserialize_error(err: &OpenAIError) -> bool {
-    let OpenAIError::JSONDeserialize(parse_err, body) = err else {
-        return false;
-    };
-
-    let parse_err_str = parse_err.to_string();
-    if !parse_err_str.contains("missing field `action`") {
-        return false;
-    }
-
-    body.contains("\"type\":\"response.output_item.added\"") && body.contains("\"web_search_call\"")
-}
-
 #[cfg(test)]
 mod tests {
-    use async_openai::types::responses::{FunctionTool, ResponseStreamEvent, Tool};
+    use async_openai::types::responses::{FunctionTool, OutputItem, ResponseStreamEvent, Tool};
 
     use super::{
         ResponseMetrics, add_explain_parameter, file_search_progress, response_progress_for_event,
@@ -916,19 +940,8 @@ mod tests {
     }
 
     #[test]
-    fn native_tool_and_text_sse_events_map_to_typed_progress() {
+    fn native_tool_sse_events_map_to_typed_progress() {
         let cases = [
-            (
-                serde_json::json!({
-                    "type": "response.output_text.delta",
-                    "sequence_number": 1,
-                    "item_id": "msg_1",
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": "hello"
-                }),
-                ResponseProgress::Generating,
-            ),
             (
                 serde_json::json!({
                     "type": "response.web_search_call.in_progress",
@@ -992,6 +1005,17 @@ mod tests {
             assert_eq!(response_progress_for_event(&event), Some(expected));
         }
 
+        let text_delta: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello"
+        }))
+        .unwrap();
+        assert_eq!(response_progress_for_event(&text_delta), None);
+
         let queued: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
             "type": "response.queued",
             "sequence_number": 8,
@@ -1044,11 +1068,38 @@ mod tests {
             serde_json::json!({"type": "search", "query": "rust tokio watch"}),
         )
         .unwrap();
-        assert_eq!(web_search_explanation(&action), "rust tokio watch");
+        assert_eq!(web_search_explanation(Some(&action)), "rust tokio watch");
 
         let action: WebSearchToolCallAction =
             serde_json::from_value(serde_json::json!({"type": "search", "query": "  "})).unwrap();
-        assert_eq!(web_search_explanation(&action), "searching the web...");
+        assert_eq!(
+            web_search_explanation(Some(&action)),
+            "searching the web..."
+        );
+        assert_eq!(web_search_explanation(None), "searching the web...");
+    }
+
+    #[test]
+    fn partial_web_search_output_item_added_can_omit_action() {
+        let event: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {
+                "id": "ws_033582bc57e46e71006af05e8f3a4887d0bcf761a456b58753",
+                "type": "web_search_call",
+                "status": "in_progress"
+            },
+            "output_index": 1,
+            "sequence_number": 4
+        }))
+        .unwrap();
+
+        let ResponseStreamEvent::ResponseOutputItemAdded(event) = event else {
+            panic!("expected output item added event");
+        };
+        let OutputItem::WebSearchCall(call) = event.item else {
+            panic!("expected web search output item");
+        };
+        assert!(call.action.is_none());
     }
 
     #[test]

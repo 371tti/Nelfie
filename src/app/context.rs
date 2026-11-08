@@ -18,6 +18,7 @@ use tokio::{
 
 use crate::{
     app::{config::Config, cron::CronScheduler, monitoring::MonitoringState},
+    discord::attachments::AttachmentRegistry,
     discord::client::DiscordClientContext,
     llm::channel::ChatContexts,
     llm::tools,
@@ -37,6 +38,7 @@ pub struct NelfieContext {
     pub voice_system: Arc<VoiceSystem>,
     pub tools: Arc<HashMap<String, Box<dyn LMTool>>>,
     pub discord_client: Arc<DiscordClientContext>,
+    pub attachment_registry: Arc<AttachmentRegistry>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub monitoring: Arc<MonitoringState>,
     pub responding_channels: Arc<DashMap<ChannelId, bool>>,
@@ -78,6 +80,7 @@ impl NelfieContext {
             voice_system: Arc::new(voice_system),
             tools: Arc::new(tools),
             discord_client: Arc::new(DiscordClientContext::default()),
+            attachment_registry: Arc::new(AttachmentRegistry::default()),
             cron_scheduler: Arc::new(CronScheduler::new()),
             monitoring: Arc::new(MonitoringState::new()),
             responding_channels: Arc::new(DashMap::new()),

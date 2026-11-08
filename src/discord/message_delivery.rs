@@ -4,7 +4,6 @@ use serenity::all::{
 };
 
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
-pub(super) const MODAL_PENDING_MESSAGE: &str = "-# thinking...";
 pub(super) const MODAL_PUBLIC_RESPONSE_MESSAGE: &str = "-# 公開回答を送信しました。";
 const MODAL_EMPTY_RESPONSE_MESSAGE: &str = "-# 完了しました。";
 
@@ -79,6 +78,48 @@ pub(super) async fn send_generated_images(
             .await?;
     }
     Ok(())
+}
+
+pub(crate) async fn send_typst_pages(
+    http: &serenity::http::Http,
+    channel_id: serenity::all::ChannelId,
+    extension: &str,
+    pages: Vec<Vec<u8>>,
+) -> Result<Vec<serenity::all::MessageId>, serenity::Error> {
+    const FILES_PER_MESSAGE: usize = 10;
+
+    let total_pages = pages.len();
+    let mut next_page = 1usize;
+    let mut remaining = pages.into_iter();
+    let mut message_ids = Vec::new();
+    loop {
+        let first_page = next_page;
+        let attachments = remaining
+            .by_ref()
+            .take(FILES_PER_MESSAGE)
+            .enumerate()
+            .map(|(index, page)| {
+                CreateAttachment::bytes(page, format!("page-{:03}.{extension}", first_page + index))
+            })
+            .collect::<Vec<_>>();
+        if attachments.is_empty() {
+            break;
+        }
+        next_page += attachments.len();
+        let last_page = next_page - 1;
+        let message = channel_id
+            .send_message(
+                http,
+                CreateMessage::new()
+                    .content(format!(
+                        "Typst {extension} pages {first_page}-{last_page}/{total_pages}"
+                    ))
+                    .add_files(attachments),
+            )
+            .await?;
+        message_ids.push(message.id);
+    }
+    Ok(message_ids)
 }
 
 pub(super) async fn send_modal_generated_images(

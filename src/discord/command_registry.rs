@@ -11,6 +11,7 @@ pub fn all() -> Vec<poise::Command<NelfieContext, CommandError>> {
         commands::disable(),
         commands::model(),
         commands::tex_expr(),
+        commands::typst_pdf(),
         commands::rate(),
         commands::cron(),
         commands::set_system_prompt(),

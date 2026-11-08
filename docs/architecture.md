@@ -31,7 +31,7 @@ Discord の slash command は `src/discord/commands/` に実装し、`command_re
 
 | 所有者 | 主な状態 | 保存先 |
 | --- | --- | --- |
-| `Config` | API token、system prompt、rate limit、管理者 ID、VOICEVOX と監視の設定 | `.env` などの環境変数。ファイルへは保存しない |
+| `Config` | API token、system prompt、rate limit、管理者 ID、VOICEVOX と監視の設定 | 非秘密設定は `config.yaml`、API token は環境変数または `.env` |
 | `ChatContexts` | チャンネルごとの会話履歴、prompt、機能フラグ、読み上げ辞書 | `data/runtime/chat_contexts.json` には設定のみ保存。会話履歴はプロセス内だけ |
 | `UserContexts` | ユーザー別モデル、unlimited 設定、話者・音声設定、個人辞書。guild bot 用設定も管理 | `data/runtime/user_contexts.json` |
 | `CronScheduler` | 登録済み cron job と次回実行時刻 | `data/runtime/cron_jobs.json` |
@@ -40,9 +40,9 @@ Discord の slash command は `src/discord/commands/` に実装し、`command_re
 
 JSON ファイルのパスは実行時の working directory からの相対パスです。各 store の書き込みは同一 store ごとに直列化し、同じディレクトリの一時ファイルを完成させてから置き換えます。`ChatContexts` は会話履歴を JSON に書き出しません。`UserContexts` は無制限を示す `rate_line=0` と `cron_rate_line=0` を保存しますが、正の値は保存しないため、再起動時に `1` へ戻ります。
 
-管理者専用の `/rate config` と `/set_system_prompt` は `ADMIN_USER_IDS` のカンマ区切り Discord user ID で制御します。未設定または空なら許可される管理者はいません。
+管理者専用の `/rate config` と `/set_system_prompt` は `config.yaml` の `admin_users` に指定した Discord user ID で制御します。未設定または空なら許可される管理者はいません。
 
-全体読み上げ辞書は `include_str!` で `global-dict.json` をビルド時に取り込みます。VOICEVOX の辞書・モデル・ONNX Runtime の配置先は README に記載された環境変数で指定します。
+全体読み上げ辞書は `include_str!` で `global-dict.json` をビルド時に取り込みます。VOICEVOX の辞書・モデル・ONNX Runtime の配置先は `config.yaml` の `voicevox_open_jtalk_dict_dir`、`voicevox_vvm_dir`、`voicevox_onnxruntime_filename` で指定します。
 
 ## メッセージから応答まで
 
@@ -58,13 +58,13 @@ bot への mention があり、対象チャンネルの ChatBot が有効な場�
 
 ### 起動条件と通常応答の入力範囲
 
-レート制限を通過したユーザー起点の要求（メンションまたはモーダル）で、OpenAI 応答を始める前にチャンネル履歴を確認します。見積りが `CONTEXT_COMPACTION_TOKEN_LIMIT` 以上なら、古いturnの圧縮をバックグラウンドで開始し、通常応答と並行して進めます。受信しただけのメッセージ、レート制限で拒否された要求、cron応答は圧縮を開始しません。既に始まった圧縮は、利用者が発言を止めた後も完了またはtimeoutまで続くことがあります。
+レート制限を通過したユーザー起点の要求（メンションまたはモーダル）で、OpenAI 応答を始める前にチャンネル履歴を確認します。見積りが `config.yaml` の `context_compaction_token_limit` 以上なら、古いturnの圧縮をバックグラウンドで開始し、通常応答と並行して進めます。受信しただけのメッセージ、レート制限で拒否された要求、cron応答は圧縮を開始しません。既に始まった圧縮は、利用者が発言を止めた後も完了またはtimeoutまで続くことがあります。
 
 要求に使う履歴は全件を送りません。`LMContext` の各 item を JSON 化し、`tiktoken-rs` の `o200k_base` で数えた推定値が、しきい値の75%以下になるよう古いuser turnから外します。System promptとdeveloper roleの要約は保持し、少なくとも最新turnは残します。この切り出しは要求用のコピーだけに適用し、チャンネル履歴自体は削除しません。画像1件につき1024 token分を追加で見積もります。
 
 `o200k_base` は明示指定です。現在の `tiktoken-rs` はGPT-6用tokenizerをモデル名から解決できないため、この数値はAPIの `usage.input_tokens` と一致する保証値ではありません。画像やtool定義などの差もあるため、推定に余裕を持たせています。最新turnと保持対象の指示だけで上限を超える場合は、それらを捨てずに送るため、この上限は絶対値ではありません。
 
-環境変数が未設定、0、または数値でない場合、`CONTEXT_COMPACTION_TOKEN_LIMIT` は `64000`、`CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS` は `4096` です。したがって通常応答の履歴目標は既定で48,000推定tokenです。Responses API が返す `usage.input_tokens` は応答記録用であり、圧縮開始・継続の判定には使いません。
+`config.yaml` に値がない場合、`context_compaction_token_limit` は `64000`、`context_summary_max_output_tokens` は `4096` です。したがって通常応答の履歴目標は既定で48,000推定tokenです。Responses API が返す `usage.input_tokens` は応答記録用であり、圧縮開始・継続の判定には使いません。
 
 ### 要約する範囲
 
@@ -78,11 +78,11 @@ bot への mention があり、対象チャンネルの ChatBot が有効な場�
 
 履歴全体を一度に要約へ送らず、APIへ送る各履歴入力に上限を設けます。turnのJSON表現自体をsegment分割する場合も全てのsegmentを処理するため、中間部分を省略して要約したり、元turnの残りを履歴から先に削除したりしません。
 
-`CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS` は各要約呼び出しの最大出力 token 数で、入力上限とは別です。複数segmentまたはbatchを統合する中間要約では、出力上限を最大1024 tokenにします。
+`config.yaml` の `context_summary_max_output_tokens` は各要約呼び出しの最大出力 token 数で、入力上限とは別です。複数segmentまたはbatchを統合する中間要約では、出力上限を最大1024 tokenにします。
 
 batchを続けるかは、圧縮後の共有履歴を同じローカルtokenizerで再計測して決めます。見積りがしきい値の75%以下になれば停止します。既定値では48,000推定tokenです。対象turnが尽きた場合や、summaryが元の対象より小さくならない場合も停止します。
 
-要約は `Models::CONTEXT_SUMMARY_MODEL`（現在は `gpt-6-luna`）への非 streaming Responses API 呼び出しで行い、tool は渡しません。全segmentとbatchを処理する一連のtaskに共通の `timeout_millis`（現在100秒）を適用します。この呼び出しはアプリ内の応答 rate limit 使用量には加算しませんが、OpenAI API の利用量には含まれます。
+要約は `Models::CONTEXT_SUMMARY_MODEL`（現在は `gpt-6-luna`）への非 streaming Responses API 呼び出しで行い、tool は渡しません。全segmentとbatchを処理する一連のtaskに共通の `config.yaml` の `timeout_millis`（既定300秒）を適用します。この呼び出しはアプリ内の応答 rate limit 使用量には加算しませんが、OpenAI API の利用量には含まれます。
 
 ### 要約の反映と失敗
 

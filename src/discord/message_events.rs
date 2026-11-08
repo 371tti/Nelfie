@@ -52,6 +52,7 @@ pub(super) async fn handle_message(
     ob_context: &NelfieContext,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let channel_id = msg.channel_id;
+    ob_context.attachment_registry.observe_message(msg);
 
     let bot_id = ctx.cache.current_user().id;
 
@@ -107,10 +108,25 @@ pub(super) async fn handle_message(
         .iter()
         .filter_map(|image| image.source.clone())
         .collect::<Vec<_>>();
-    let attachment_context = image_attachments
+    let mut attachment_context = image_attachments
         .iter()
         .map(MessageImageAttachment::to_context_json)
         .collect::<Vec<_>>();
+    let image_attachment_ids = image_attachments
+        .iter()
+        .map(|attachment| attachment.attachment_id)
+        .collect::<std::collections::HashSet<_>>();
+    attachment_context.extend(
+        ob_context
+            .attachment_registry
+            .list(channel_id)
+            .into_iter()
+            .filter(|reference| {
+                reference.message_id == Some(msg.id.get())
+                    && !image_attachment_ids.contains(&reference.attachment_id)
+            })
+            .map(|reference| reference.to_json()),
+    );
 
     let content = serde_json::json!({
         "user": msg.author.name,
@@ -120,18 +136,16 @@ pub(super) async fn handle_message(
         "content": msg.content,
         "attachments": attachment_context,
     }).to_string();
+    let attachment_count = msg.attachments.len();
 
     let mut lm_context = LMContext::new();
     if image_sources.is_empty() {
-        debug!(
-            "Adding text message to context in channel {}, content: {}",
-            channel_id, content
-        );
+        debug!("Adding text message to context in channel {}", channel_id);
         lm_context.add_text(content.clone(), Role::User);
     } else {
         debug!(
-            "Adding image message to context in channel {}, content: {}",
-            channel_id, content
+            "Adding image message to context in channel {} ({} attachment(s))",
+            channel_id, attachment_count
         );
         lm_context.add_user_text_with_discord_images(content.clone(), image_sources);
     }

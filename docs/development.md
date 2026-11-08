@@ -4,7 +4,7 @@
 
 Rust 2024 edition に対応した Rust toolchain を使います。必要な環境変数、OS 要件、VOICEVOX の配置と初回起動の動作はリポジトリ直下の [README.md](../README.md) を参照してください。
 
-リポジトリのルートで `.env` を用意し、必須の `DISCORD_TOKEN` と `OPENAI_API_KEY` を設定してから実行します。管理者専用コマンドを使う場合は `ADMIN_USER_IDS` に数値の Discord user ID をカンマ区切りで指定します。未設定または空なら管理者専用コマンドは誰にも許可されません。数値以外を含めると起動時にエラーになります。
+リポジトリのルートで `.env` を用意し、必須の `DISCORD_TOKEN` と `OPENAI_API_KEY` を設定してから実行します。初回起動時に `config.yaml` が自動生成され、非秘密設定はそこから読み込まれます。管理者専用コマンドを使う場合は `admin_users` に数値の Discord user ID を YAML のリスト形式で指定します。未設定または空なら管理者専用コマンドは誰にも許可されません。
 
 ```powershell
 cargo run --locked
@@ -41,7 +41,7 @@ RUST_LOG=warn,nelfie=debug
 
 ## TCP 監視
 
-`TcpMonitorServer` は `MONITOR_TCP_BIND` で指定されたアドレスに bind します。既定値は `127.0.0.1:9791` です。接続後に `METRICS\n` を送ると、空行で終端する key-value 応答が返ります。
+`TcpMonitorServer` は `config.yaml` の `monitor_tcp_bind` で指定されたアドレスに bind します。既定値は `127.0.0.1:9791` です。接続後に `METRICS\n` を送ると、空行で終端する key-value 応答が返ります。
 
 - 受信要求は最大 64 bytes、読み取り timeout は 2 秒です。
 - 同時クライアントは最大 16 接続です。上限を超えた接続は閉じられます。

@@ -739,7 +739,7 @@ fn is_message_item(item: &InputItem) -> bool {
 
 fn reasoning_item_id(item: &InputItem) -> Option<&str> {
     if let InputItem::Item(Item::Reasoning(reasoning)) = item {
-        Some(&reasoning.id)
+        reasoning.id.as_deref()
     } else {
         None
     }
@@ -899,7 +899,7 @@ mod tests {
 
     fn reasoning_item(id: &str) -> InputItem {
         InputItem::Item(Item::Reasoning(ReasoningItem {
-            id: id.to_string(),
+            id: Some(id.to_string()),
             summary: Vec::new(),
             content: None,
             encrypted_content: None,

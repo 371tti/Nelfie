@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use log::{error, info};
 use poise::CreateReply;
-use serenity::all::{CreateAttachment, CreateEmbed};
+use serenity::all::{Attachment, CreateAttachment, CreateEmbed};
 
 use crate::llm::{
     models::{ImageGenerationModels, Models},
@@ -10,7 +10,7 @@ use crate::llm::{
     user::UserContextScope,
 };
 
-use super::shared::{Context, Error};
+use super::shared::{Context, Error, preview_text};
 
 /// ping pong..
 #[poise::command(slash_command, prefix_command)]
@@ -91,6 +91,7 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     let ob_ctx = ctx.data();
 
     ob_ctx.chat_contexts.clear(channel_id);
+    ob_ctx.attachment_registry.clear_channel(channel_id);
 
     info!("Cleared chat context for channel {}", channel_id);
 
@@ -264,6 +265,188 @@ pub async fn tex_expr(
         .await?;
 
     Ok(())
+}
+
+/// Render Typst source as a PDF.
+#[poise::command(slash_command, rename = "typst")]
+pub async fn typst_pdf(
+    ctx: Context<'_>,
+    #[description = "Typst source text"] source: Option<String>,
+    #[description = "Upload a .typ source file"] source_file: Option<Attachment>,
+    #[description = "Upload one image, font, or project asset"] asset_file: Option<Attachment>,
+    #[description = "Comma-separated Discord attachment IDs for images, fonts, or source assets"]
+    asset_ids: Option<String>,
+    #[description = "Output format: png (default), svg, or pdf"] format: Option<String>,
+) -> Result<(), Error> {
+    if source.is_some() == source_file.is_some() {
+        ctx.say("`source` または `source_file` のどちらか一つを指定してください。")
+            .await?;
+        return Ok(());
+    }
+    let asset_ids = match parse_attachment_ids(asset_ids.as_deref()) {
+        Ok(asset_ids) => asset_ids,
+        Err(error) => {
+            ctx.say(preview_text(&error, 1500)).await?;
+            return Ok(());
+        }
+    };
+    let format = match format
+        .as_deref()
+        .map(crate::typst_render::TypstOutputFormat::parse)
+        .transpose()
+    {
+        Ok(format) => format.unwrap_or_default(),
+        Err(error) => {
+            ctx.say(preview_text(&error, 1500)).await?;
+            return Ok(());
+        }
+    };
+    ctx.defer().await?;
+
+    let (source_filename, source) = if let Some(source) = source {
+        if source.trim().is_empty() {
+            ctx.send(CreateReply::default().content("Typstソースが空です。"))
+                .await?;
+            return Ok(());
+        }
+        ("main.typ".to_string(), source)
+    } else {
+        let attachment = source_file.expect("validated source attachment");
+        if u64::from(attachment.size) > 25 * 1024 * 1024 {
+            ctx.send(CreateReply::default().content("ソースファイルは25 MiBまでです。"))
+                .await?;
+            return Ok(());
+        }
+        let bytes = match crate::discord::attachments::download_attachment_url(
+            &attachment.url,
+            25 * 1024 * 1024,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                ctx.send(CreateReply::default().content(preview_text(&error, 1500)))
+                    .await?;
+                return Ok(());
+            }
+        };
+        match crate::typst_render::source_from_asset(crate::typst_render::TypstAsset {
+            filename: attachment.filename,
+            content_type: attachment.content_type,
+            bytes,
+        }) {
+            Ok(source) => source,
+            Err(error) => {
+                ctx.send(CreateReply::default().content(preview_text(&error, 1500)))
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let mut assets =
+        match crate::typst_render::load_registry_assets(ctx.data(), &asset_ids, None).await {
+            Ok(assets) => assets,
+            Err(error) => {
+                ctx.send(CreateReply::default().content(preview_text(&error, 1500)))
+                    .await?;
+                return Ok(());
+            }
+        };
+    if let Some(attachment) = asset_file {
+        if u64::from(attachment.size) > 25 * 1024 * 1024 {
+            ctx.send(CreateReply::default().content("素材ファイルは25 MiBまでです。"))
+                .await?;
+            return Ok(());
+        }
+        let bytes = match crate::discord::attachments::download_attachment_url(
+            &attachment.url,
+            25 * 1024 * 1024,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                ctx.send(CreateReply::default().content(preview_text(&error, 1500)))
+                    .await?;
+                return Ok(());
+            }
+        };
+        assets.push(crate::typst_render::TypstAsset {
+            filename: attachment.filename,
+            content_type: attachment.content_type,
+            bytes,
+        });
+    }
+    let rendered = crate::typst_render::render(crate::typst_render::TypstRenderInput {
+        source_filename,
+        source,
+        assets,
+        format,
+    })
+    .await;
+    match rendered {
+        Ok(output) => match output.content {
+            crate::typst_render::TypstRenderContent::Pdf(pdf) => {
+                let reply = CreateReply::default()
+                    .content(if output.warnings.is_empty() {
+                        "Typst PDFを生成しました。".to_string()
+                    } else {
+                        preview_text(
+                            &format!("Typst PDFを生成しました。\n{}", output.warnings.join("\n")),
+                            1800,
+                        )
+                    })
+                    .attachment(CreateAttachment::bytes(pdf, "document.pdf"));
+                ctx.send(reply).await?;
+            }
+            crate::typst_render::TypstRenderContent::Pages(pages) => {
+                let page_count = pages.len();
+                crate::discord::message_delivery::send_typst_pages(
+                    ctx.http(),
+                    ctx.channel_id(),
+                    format.extension(),
+                    pages,
+                )
+                .await?;
+                let summary = if output.warnings.is_empty() {
+                    format!(
+                        "Typst {0} を {page_count} ページ送信しました。",
+                        format.extension()
+                    )
+                } else {
+                    preview_text(
+                        &format!(
+                            "Typst {} を {page_count} ページ送信しました。\n{}",
+                            format.extension(),
+                            output.warnings.join("\n")
+                        ),
+                        1800,
+                    )
+                };
+                ctx.say(summary).await?;
+            }
+        },
+        Err(error) => {
+            ctx.send(CreateReply::default().content(preview_text(&error, 1800)))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_attachment_ids(value: Option<&str>) -> Result<Vec<u64>, String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("添付ID `{value}` が不正です: {error}"))
+        })
+        .collect()
 }
 
 async fn autocomplete_tex_expr(_ctx: Context<'_>, partial: &str) -> Vec<String> {

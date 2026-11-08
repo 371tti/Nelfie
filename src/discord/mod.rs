@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod bot;
 pub mod client;
 pub mod command_registry;

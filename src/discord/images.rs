@@ -6,9 +6,10 @@ use tokio::time::{Duration, timeout};
 
 use crate::llm::context::{DiscordImageSource, LMContext};
 
-const DISCORD_IMAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+const DISCORD_IMAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(super) struct MessageImageAttachment {
+    pub(super) attachment_id: u64,
     filename: String,
     content_type: Option<String>,
     size: u32,
@@ -18,6 +19,7 @@ pub(super) struct MessageImageAttachment {
 impl MessageImageAttachment {
     pub(super) fn to_context_json(&self) -> serde_json::Value {
         serde_json::json!({
+            "attachment_id": self.attachment_id.to_string(),
             "filename": self.filename,
             "content_type": self.content_type,
             "size": self.size,
@@ -59,6 +61,7 @@ pub(super) fn message_image_attachments(msg: &Message) -> Vec<MessageImageAttach
             }
 
             Some(MessageImageAttachment {
+                attachment_id: attachment.id.get(),
                 filename: attachment.filename.clone(),
                 content_type: content_type.map(str::to_string),
                 size: attachment.size,
