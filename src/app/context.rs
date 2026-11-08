@@ -10,7 +10,11 @@ use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use dashmap::DashMap;
 use log::info;
 use serenity::all::ChannelId;
-use tokio::task::AbortHandle;
+use tokio::{
+    sync::watch,
+    task::AbortHandle,
+    time::{Duration, sleep, timeout},
+};
 
 use crate::{
     app::{config::Config, cron::CronScheduler, monitoring::MonitoringState},
@@ -44,6 +48,7 @@ pub struct NelfieContext {
 pub struct ActiveResponse {
     pub request_id: u64,
     pub abort_handle: AbortHandle,
+    pub cancel_sender: watch::Sender<bool>,
 }
 
 impl NelfieContext {
@@ -88,8 +93,25 @@ impl NelfieContext {
     pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.monitoring.mark_gateway_disconnected();
         self.monitoring.set_voicevox_ready(false);
-        for active in self.active_responses.iter() {
-            active.abort_handle.abort();
+        let active_responses = self
+            .active_responses
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for active in &active_responses {
+            let _ = active.cancel_sender.send(true);
+        }
+        let drained = timeout(Duration::from_secs(6), async {
+            while !self.active_responses.is_empty() {
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !drained {
+            for active in &active_responses {
+                active.abort_handle.abort();
+            }
         }
         self.active_responses.clear();
         self.responding_channels.clear();

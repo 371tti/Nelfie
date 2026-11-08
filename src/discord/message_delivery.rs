@@ -1,10 +1,10 @@
 use serenity::all::{
     CreateAttachment, CreateInteractionResponseFollowup, CreateMessage, EditInteractionResponse,
-    ModalInteraction,
+    EditMessage, ModalInteraction,
 };
 
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
-pub(super) const MODAL_PENDING_MESSAGE: &str = "採点中...";
+pub(super) const MODAL_PENDING_MESSAGE: &str = "-# thinking...";
 pub(super) const MODAL_PUBLIC_RESPONSE_MESSAGE: &str = "-# 公開回答を送信しました。";
 const MODAL_EMPTY_RESPONSE_MESSAGE: &str = "-# 完了しました。";
 
@@ -37,6 +37,34 @@ pub(super) async fn send_long_message(
         send_code_attachments(http, channel_id, &attachments).await?;
     }
 
+    Ok(())
+}
+
+pub(super) async fn append_footer_to_sent_message(
+    http: &serenity::http::Http,
+    channel_id: serenity::all::ChannelId,
+    message_id: serenity::all::MessageId,
+    content: &str,
+    footer: &str,
+) -> Result<(), serenity::Error> {
+    let content_with_footer = if content.is_empty() {
+        footer.to_string()
+    } else {
+        format!("{content}\n{footer}")
+    };
+    if discord_character_count(&content_with_footer) <= DISCORD_MESSAGE_LIMIT {
+        channel_id
+            .edit_message(
+                http,
+                message_id,
+                EditMessage::new().content(content_with_footer),
+            )
+            .await?;
+    } else {
+        channel_id
+            .send_message(http, CreateMessage::new().content(footer))
+            .await?;
+    }
     Ok(())
 }
 

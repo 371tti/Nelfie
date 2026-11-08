@@ -17,8 +17,8 @@ use super::{
     core_runtime::CoreRuntime,
     text::{normalize_tts_text, normalize_tts_text_full, split_tts_segments},
     types::{
-        GuildVoiceConfig, SpeakOptions, SpeakRequest, VoiceCoreConfig,
-        normalize_parallel_count,
+        GuildVoiceConfig, SpeakOptions, SpeakRequest, VOICE_PARALLEL_COUNT_DEFAULT,
+        VoiceCoreConfig, normalize_parallel_count,
     },
 };
 
@@ -384,10 +384,10 @@ impl VoiceSystem {
 
         self.channel_parallel_counts
             .entry(channel_id)
-            .or_insert(DEFAULT_PARALLEL_READ_COUNT);
+            .or_insert(VOICE_PARALLEL_COUNT_DEFAULT);
         self.channel_parallel_semaphores
             .entry(channel_id)
-            .or_insert_with(|| Arc::new(Semaphore::new(DEFAULT_PARALLEL_READ_COUNT)));
+            .or_insert_with(|| Arc::new(Semaphore::new(VOICE_PARALLEL_COUNT_DEFAULT)));
 
         let this = self.clone();
         tokio::spawn(async move {
@@ -396,7 +396,7 @@ impl VoiceSystem {
                     .channel_parallel_semaphores
                     .get(&channel_id)
                     .map(|entry| Arc::clone(entry.value()))
-                    .unwrap_or_else(|| Arc::new(Semaphore::new(DEFAULT_PARALLEL_READ_COUNT)));
+                    .unwrap_or_else(|| Arc::new(Semaphore::new(VOICE_PARALLEL_COUNT_DEFAULT)));
 
                 let Ok(permit) = semaphore.acquire_owned().await else {
                     break;
@@ -434,7 +434,7 @@ impl VoiceSystem {
         // 1セグメント先読みで、現在セグメント再生中に次セグメントの合成を進める
         // これにより、同一メッセージ内の順序を保ちつつ区切り間の待ちを減らす
         // あと1セグメント先読み以上だと集中時にメモリ爆死する可能性があるから、、メモリ圧は上げないよーに
-        let allow_overlap_playback = req.parallel_count > DEFAULT_PARALLEL_READ_COUNT;
+        let allow_overlap_playback = req.parallel_count > VOICE_PARALLEL_COUNT_DEFAULT;
         let mut segments = segments.into_iter();
         let Some(first_segment) = segments.next() else {
             return;

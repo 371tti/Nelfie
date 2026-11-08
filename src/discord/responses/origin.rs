@@ -184,20 +184,6 @@ impl ResponseOrigin {
         }
     }
 
-    pub(super) fn thinking_label(&self) -> &'static str {
-        match self {
-            Self::User(_) => "-# Thinking...",
-            Self::Cron(_) => "-# Scheduled task running...",
-        }
-    }
-
-    pub(super) fn uses_public_progress(&self) -> bool {
-        match self {
-            Self::User(user) => user.delivery.uses_public_progress(),
-            Self::Cron(_) => true,
-        }
-    }
-
     pub(super) fn modal_ephemeral_delivery(&self) -> Option<&ModalEphemeralDelivery> {
         match self {
             Self::User(user) => user.delivery.modal_ephemeral_delivery(),
@@ -237,10 +223,6 @@ impl UserResponseRequest {
 }
 
 impl UserResponseDelivery {
-    pub(super) fn uses_public_progress(&self) -> bool {
-        matches!(self, Self::Channel)
-    }
-
     pub(super) fn modal_ephemeral_delivery(&self) -> Option<&ModalEphemeralDelivery> {
         match self {
             Self::Channel => None,

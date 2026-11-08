@@ -1,9 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use async_openai::types::responses::{
-    EasyInputContent, EasyInputMessage, FunctionToolCall, ImageDetail, InputContent,
-    InputImageContent, InputItem, InputMessage, InputParam, InputRole, Item, MessageItem,
-    MessageType, OutputMessageContent,
+    EasyInputContent, EasyInputMessage, FunctionCallOutput, FunctionToolCall, ImageDetail,
+    InputContent, InputImageContent, InputItem, InputMessage, InputParam, InputRole, Item,
+    MessageItem, MessageType, OutputMessageContent,
 };
 use tiktoken_rs::o200k_base_singleton;
 
@@ -25,27 +25,14 @@ pub fn compaction_target_tokens(trigger_tokens: u32) -> usize {
 pub struct DiscordSendRecord {
     pub content: String,
     pub private: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PromptCacheUsage {
-    pub input_tokens: u32,
-    pub cached_tokens: u32,
-}
-
-impl PromptCacheUsage {
-    pub fn hit(self) -> bool {
-        self.cached_tokens > 0
-    }
+    pub channel_id: Option<u64>,
+    pub message_id: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LMContext {
     pub buf: VecDeque<InputItem>,
     pub discord_image_sources: Vec<DiscordImageSource>,
-    last_response_total_tokens: Option<u32>,
-    last_response_cache_usage: Option<PromptCacheUsage>,
-    response_completed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,18 +62,12 @@ impl LMContext {
         Self {
             buf: VecDeque::new(),
             discord_image_sources: Vec::new(),
-            last_response_total_tokens: None,
-            last_response_cache_usage: None,
-            response_completed: false,
         }
     }
 
     pub fn clear(&mut self) {
         self.buf.clear();
         self.discord_image_sources.clear();
-        self.last_response_total_tokens = None;
-        self.last_response_cache_usage = None;
-        self.response_completed = false;
     }
 
     pub fn generate_context(&self) -> InputParam {
@@ -103,9 +84,6 @@ impl LMContext {
         let mut sanitized = LMContext {
             buf: combined,
             discord_image_sources: Vec::new(),
-            last_response_total_tokens: self.last_response_total_tokens,
-            last_response_cache_usage: self.last_response_cache_usage,
-            response_completed: false,
         };
         sanitized.sanitize_tool_history();
         InputParam::Items(sanitized.buf.into())
@@ -120,38 +98,8 @@ impl LMContext {
         }
         self.discord_image_sources
             .extend(other.discord_image_sources.iter().cloned());
-        if other.response_completed {
-            self.last_response_total_tokens = other.last_response_total_tokens;
-            self.last_response_cache_usage = other.last_response_cache_usage;
-        }
-        self.response_completed = false;
         self.sanitize_tool_history();
         self.prune_discord_image_sources_to_present_urls();
-    }
-
-    pub fn record_response_usage(
-        &mut self,
-        total_tokens: u32,
-        input_tokens: u32,
-        cached_tokens: u32,
-    ) {
-        self.last_response_total_tokens = Some(
-            self.last_response_total_tokens
-                .unwrap_or_default()
-                .saturating_add(total_tokens),
-        );
-
-        let cache_usage = self.last_response_cache_usage.get_or_insert_default();
-        cache_usage.input_tokens = cache_usage.input_tokens.saturating_add(input_tokens);
-        cache_usage.cached_tokens = cache_usage.cached_tokens.saturating_add(cached_tokens);
-    }
-
-    pub fn response_total_tokens(&self) -> Option<u32> {
-        self.last_response_total_tokens
-    }
-
-    pub fn mark_response_completed(&mut self) {
-        self.response_completed = true;
     }
 
     pub fn serialized_input_bytes(&self) -> usize {
@@ -217,10 +165,6 @@ impl LMContext {
             .collect();
         self.prune_discord_image_sources_to_present_urls();
         (before.saturating_sub(self.buf.len()), retained_tokens)
-    }
-
-    pub fn response_cache_usage(&self) -> Option<PromptCacheUsage> {
-        self.last_response_cache_usage
     }
 
     pub fn plan_compaction(
@@ -332,12 +276,6 @@ impl LMContext {
         self.buf.push_front(compaction_summary_item(summary));
         self.prune_discord_image_sources_to_present_urls();
         true
-    }
-
-    pub fn reset_compaction_measurements(&mut self) {
-        self.last_response_total_tokens = None;
-        self.last_response_cache_usage = None;
-        self.response_completed = false;
     }
 
     fn sanitize_tool_history(&mut self) {
@@ -522,7 +460,42 @@ impl LMContext {
             };
 
             let content = args.get("content").and_then(|v| v.as_str())?.to_string();
-            Some(DiscordSendRecord { content, private })
+            let tool_output = self.buf.iter().rev().find_map(|item| {
+                let InputItem::Item(Item::FunctionCallOutput(output)) = item else {
+                    return None;
+                };
+                if output.call_id != call.call_id {
+                    return None;
+                }
+                let FunctionCallOutput::Text(output) = &output.output else {
+                    return None;
+                };
+                serde_json::from_str::<serde_json::Value>(output).ok()
+            });
+            if tool_output
+                .as_ref()
+                .and_then(|output| output.get("status"))
+                .and_then(serde_json::Value::as_str)
+                != Some("ok")
+            {
+                return None;
+            }
+            let read_snowflake = |key: &str| {
+                tool_output
+                    .as_ref()
+                    .and_then(|output| output.get(key))
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+                    })
+            };
+            Some(DiscordSendRecord {
+                content,
+                private,
+                channel_id: read_snowflake("channel_id"),
+                message_id: read_snowflake("message_id"),
+            })
         })
     }
 }
@@ -954,6 +927,21 @@ mod tests {
         }))
     }
 
+    fn discord_send_call_item(call_id: &str, operation: &str, content: &str) -> InputItem {
+        InputItem::Item(Item::FunctionCall(FunctionToolCall {
+            arguments: serde_json::json!({
+                "operation": operation,
+                "content": content
+            })
+            .to_string(),
+            call_id: call_id.to_string(),
+            namespace: None,
+            name: "discord-tool".to_string(),
+            id: None,
+            status: None,
+        }))
+    }
+
     fn input_items(input: InputParam) -> Vec<InputItem> {
         match input {
             InputParam::Items(items) => items,
@@ -991,6 +979,57 @@ mod tests {
                 .iter()
                 .any(|item| function_tool_output_call_id(item) == Some("call_1"))
         );
+    }
+
+    #[test]
+    fn latest_discord_send_record_reads_message_target_from_tool_result() {
+        let mut context = LMContext::new();
+        context
+            .buf
+            .push_back(discord_send_call_item("call_1", "send_message", "hello"));
+        context
+            .buf
+            .push_back(InputItem::Item(Item::FunctionCallOutput(
+                FunctionCallOutputItemParam {
+                    call_id: "call_1".to_string(),
+                    output: FunctionCallOutput::Text(
+                        serde_json::json!({
+                        "status": "ok",
+                            "channel_id": "123",
+                            "message_id": "456"
+                        })
+                        .to_string(),
+                    ),
+                    id: None,
+                    status: None,
+                },
+            )));
+
+        let record = context.get_latest_discord_send_record().unwrap();
+        assert_eq!(record.content, "hello");
+        assert!(!record.private);
+        assert_eq!(record.channel_id, Some(123));
+        assert_eq!(record.message_id, Some(456));
+    }
+
+    #[test]
+    fn failed_discord_send_is_not_treated_as_a_delivered_message() {
+        let mut context = LMContext::new();
+        context
+            .buf
+            .push_back(discord_send_call_item("call_1", "send_message", "hello"));
+        context
+            .buf
+            .push_back(InputItem::Item(Item::FunctionCallOutput(
+                FunctionCallOutputItemParam {
+                    call_id: "call_1".to_string(),
+                    output: FunctionCallOutput::Text("Error: missing permission".to_string()),
+                    id: None,
+                    status: None,
+                },
+            )));
+
+        assert!(context.get_latest_discord_send_record().is_none());
     }
 
     #[test]
@@ -1051,7 +1090,6 @@ mod tests {
         for message in ["old one", "old two", "recent one", "recent two"] {
             history.add_text(message.to_string(), Role::User);
         }
-        history.record_response_usage(10_000, 10_000, 0);
         let compaction = history.plan_compaction(1, 0).unwrap();
 
         history.add_text("arrived while summarizing".to_string(), Role::User);
@@ -1063,7 +1101,6 @@ mod tests {
                 .unwrap()
                 .contains("important earlier details")
         );
-        assert_eq!(history.response_total_tokens(), Some(10_000));
     }
 
     #[test]
@@ -1072,7 +1109,6 @@ mod tests {
         for message in ["old one", "old two", "recent"] {
             history.add_text(message.to_string(), Role::User);
         }
-        history.record_response_usage(10_000, 10_000, 0);
         let compaction = history.plan_compaction(1, 0).unwrap();
 
         history.clear();
@@ -1089,8 +1125,6 @@ mod tests {
         history.add_user_text_with_images("old image".to_string(), vec![image_url.to_string()]);
         history.add_text("middle request".to_string(), Role::User);
         history.add_text("recent request".to_string(), Role::User);
-        history.record_response_usage(10_000, 10_000, 0);
-
         let compaction = history.plan_compaction(1, 0).unwrap();
         let serialized =
             serde_json::to_string(&compaction.summary_contexts()[0].generate_context()).unwrap();

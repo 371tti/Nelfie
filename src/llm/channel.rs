@@ -17,8 +17,8 @@ use crate::{
         context::{LMContext, LMContextCompaction},
         parse_u64,
         voice_dictionary::{
-            entries_as_pairs, entries_from_json, entries_to_json, prepare_entry,
-            prepare_source, remove_entry, set_entry,
+            entries_as_pairs, entries_from_json, entries_to_json, prepare_entry, prepare_source,
+            remove_entry, set_entry,
         },
     },
     voice::normalize_parallel_count,
@@ -196,10 +196,6 @@ impl ChatContexts {
         match self.compacting_contexts.entry(channel_id) {
             Entry::Occupied(entry) if entry.get().id == compaction_id => {
                 let recheck_requested = entry.get().recheck_requested;
-                if !recheck_requested && let Some(mut context) = self.contexts.get_mut(&channel_id)
-                {
-                    context.context.reset_compaction_measurements();
-                }
                 entry.remove();
                 recheck_requested
             }
@@ -496,7 +492,6 @@ mod tests {
         for text in ["old one", "old two", "recent"] {
             context.add_text(text.to_string(), Role::User);
         }
-        context.record_response_usage(1_000, 1_000, 0);
         context
     }
 
