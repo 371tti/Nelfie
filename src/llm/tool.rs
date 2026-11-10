@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_openai::types::responses::{FunctionTool, InputItem, Tool};
-use serenity::all::ChannelId;
+use serenity::all::{ChannelId, MessageId, UserId};
 
 use crate::app::context::NelfieContext;
 use crate::llm::user::UserContextScope;
@@ -10,6 +10,8 @@ use crate::typst_render::TypstDraftStore;
 #[derive(Clone)]
 pub struct ToolExecutionContext {
     pub channel_id: ChannelId,
+    pub reply_to_message_id: Option<MessageId>,
+    pub request_author_id: Option<UserId>,
     pub user_context_scope: UserContextScope,
     pub allow_mainline_model_change: bool,
     pub image_generation_enabled: bool,

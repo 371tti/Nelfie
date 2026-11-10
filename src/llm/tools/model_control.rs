@@ -9,15 +9,11 @@ use crate::{
 };
 
 const DESCRIPTION: &str = concat!(
-    "Read or change the user's selected model. Targets: mainline for the Responses LLM, or ",
-    "image_generation for the built-in image tool. Before generating or editing an image, ",
-    "call this tool with action=get and target=image_generation, or action=set and ",
-    "target=image_generation if the user requested a specific image model. The image tool ",
-    "becomes available on the next API round with that selection. Image model selection is ",
-    "limited to gpt-image-2.5-flare (default) and gpt-image-2.5-sunburst. Mainline selection ",
-    "is limited to the available LLM model IDs. Mainline changes apply from the next API ",
-    "round; reasoning effort remains low. Do not call image generation in the same round as ",
-    "changing its model."
+    "Inspect or change the current user's selected model. Use get to read selections and set ",
+    "only when the user asks to switch models. Valid targets and model IDs are supplied by ",
+    "the schema and can vary by API round. A change applies from the next API round; choose ",
+    "an image-generation model before a round that includes image generation. Mainline ",
+    "reasoning effort stays low; this tool does not change it."
 );
 
 pub struct ModelControlTool;
@@ -57,17 +53,17 @@ impl ModelControlTool {
                 "action": {
                     "type": "string",
                     "enum": ["get", "set"],
-                    "description": "Read current selections or change one."
+                    "description": "Use get to inspect selections; use set to change one model and provide its target and model ID."
                 },
                 "target": {
                     "type": "string",
                     "enum": targets,
-                    "description": "mainline changes the Responses LLM; image_generation changes the built-in image tool model."
+                    "description": "Use only a target listed for this API round: mainline is the chat model and cannot be changed by scheduled responses; image_generation is the built-in image model. Omit for get to inspect both."
                 },
                 "model": {
                     "type": "string",
                     "enum": model_names,
-                    "description": "A model ID valid for the chosen target."
+                    "description": "Model ID for the selected target. Required by set; omit for get. The schema lists IDs for both targets, so choose a model valid for the selected target."
                 },
                 "$explain": {
                     "type": "string",

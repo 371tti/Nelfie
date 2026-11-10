@@ -1,4 +1,4 @@
-use serenity::all::{ChannelId, GuildId, Message, ModalInteraction, UserId};
+use serenity::all::{ChannelId, GuildId, Message, MessageId, ModalInteraction, UserId};
 
 use crate::{
     discord::ephemeral::EphemeralInteractionContext,
@@ -79,7 +79,31 @@ pub(super) struct UserResponseRequest {
     pub(super) user_id: UserId,
     pub(super) guild_id: Option<GuildId>,
     pub(super) channel_id: ChannelId,
+    pub(super) source_message_id: Option<MessageId>,
+    pub(super) trigger: Option<UserResponseTrigger>,
     pub(super) delivery: UserResponseDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UserResponseTrigger {
+    Mention,
+    AutoReplay,
+}
+
+impl UserResponseTrigger {
+    fn log_source(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::AutoReplay => "auto_reply",
+        }
+    }
+
+    fn system_note(self) -> String {
+        match self {
+            Self::Mention => "Response trigger: the user directly mentioned Nelfie in the current Discord message.".to_string(),
+            Self::AutoReplay => "Response trigger: the auto-reply Judge selected respond for the current channel message. The user did not directly mention Nelfie.".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +144,10 @@ impl ResponseOrigin {
     pub(super) fn log_source(&self) -> &'static str {
         match self {
             Self::User(user) => match &user.delivery {
-                UserResponseDelivery::Channel => "message",
+                UserResponseDelivery::Channel => user
+                    .trigger
+                    .map(UserResponseTrigger::log_source)
+                    .unwrap_or("message"),
                 UserResponseDelivery::ModalEphemeral(_) => "modal",
             },
             Self::Cron(cron) if cron.manual => "cron_test",
@@ -166,6 +193,13 @@ impl ResponseOrigin {
         }
     }
 
+    pub(super) fn reply_context(&self) -> (Option<MessageId>, Option<UserId>) {
+        match self {
+            Self::User(user) => (user.source_message_id, Some(user.user_id)),
+            Self::Cron(_) => (None, None),
+        }
+    }
+
     pub(super) fn triggers_context_compaction(&self) -> bool {
         matches!(self, Self::User(_))
     }
@@ -179,7 +213,10 @@ impl ResponseOrigin {
 
     pub(super) fn system_note(&self) -> Option<String> {
         match self {
-            Self::User(user) => user.delivery.system_note(user.user_id),
+            Self::User(user) => match &user.delivery {
+                UserResponseDelivery::Channel => user.trigger.map(UserResponseTrigger::system_note),
+                UserResponseDelivery::ModalEphemeral(_) => user.delivery.system_note(user.user_id),
+            },
             Self::Cron(cron) => Some(cron.system_note()),
         }
     }
@@ -200,11 +237,13 @@ impl ResponseOrigin {
 }
 
 impl UserResponseRequest {
-    pub(super) fn from_message(msg: &Message) -> Self {
+    pub(super) fn from_message(msg: &Message, trigger: UserResponseTrigger) -> Self {
         Self {
             user_id: msg.author.id,
             guild_id: msg.guild_id,
             channel_id: msg.channel_id,
+            source_message_id: Some(msg.id),
+            trigger: Some(trigger),
             delivery: UserResponseDelivery::Channel,
         }
     }
@@ -214,6 +253,8 @@ impl UserResponseRequest {
             user_id: modal.user.id,
             guild_id: modal.guild_id,
             channel_id: modal.channel_id,
+            source_message_id: None,
+            trigger: None,
             delivery: UserResponseDelivery::ModalEphemeral(Box::new(ModalEphemeralDelivery {
                 modal_custom_id: modal.data.custom_id.clone(),
                 interaction: modal.clone(),
@@ -258,11 +299,27 @@ impl UserResponseDelivery {
              conversation history, and tool calls. \
              If the answer should be visible only to the respondent, respond normally; the final \
              assistant answer will edit the original ephemeral modal response. \
-             If the answer should be public in the channel, use discord-tool operation \
-             send_message, and do not repeat the same public body in the normal assistant reply. \
+             If the answer should be public in the channel, use discord-reply when a reply, \
+             mention, or separate sequential post is useful; otherwise use discord-tool \
+             send_message. Do not repeat posted text in the normal assistant reply. \
              You may also use discord-tool operation send_ephemeral_message to update the \
              respondent-only ephemeral response explicitly.",
             user_id
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserResponseTrigger;
+
+    #[test]
+    fn response_trigger_notes_distinguish_mentions_from_judge_responses() {
+        let mention = UserResponseTrigger::Mention.system_note();
+        let auto_replay = UserResponseTrigger::AutoReplay.system_note();
+
+        assert!(mention.contains("directly mentioned Nelfie"));
+        assert!(auto_replay.contains("auto-reply Judge selected respond"));
+        assert_ne!(mention, auto_replay);
     }
 }

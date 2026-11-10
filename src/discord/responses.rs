@@ -9,7 +9,7 @@ use serenity::all::{
     CreateMessage, EditInteractionResponse, EditMessage, Message, ModalInteraction,
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant as TokioInstant, MissedTickBehavior, interval, timeout, timeout_at},
 };
@@ -21,14 +21,17 @@ use crate::{
         images::refresh_discord_image_urls_for_api,
         logging::log_err,
         message_delivery::{
-            MODAL_PUBLIC_RESPONSE_MESSAGE, append_footer_to_sent_message, send_generated_images,
-            send_long_message, send_modal_ephemeral_response, send_modal_generated_images,
+            MODAL_PUBLIC_RESPONSE_MESSAGE, append_footer_to_sent_message, send_footer_message,
+            send_generated_images, send_long_message, send_modal_ephemeral_response,
+            send_modal_footer, send_modal_generated_images,
         },
     },
     llm::{
+        channel::AutoReplayJudgeToken,
         client::{GenerateResponseOptions, ResponseProgress},
         compaction::schedule_context_compaction,
         context::{DiscordSendRecord, Role, compaction_target_tokens},
+        prompt::{DISCORD_HISTORY_FORMAT, DISCORD_REPLY_OUTPUT_INSTRUCTIONS},
         user::UserContextScope,
     },
 };
@@ -37,7 +40,9 @@ mod origin;
 mod rate_limit;
 
 pub use origin::CronResponseRequest;
-use origin::{RateLimitBucket, RateLimitTarget, ResponseOrigin, UserResponseRequest};
+use origin::{
+    RateLimitBucket, RateLimitTarget, ResponseOrigin, UserResponseRequest, UserResponseTrigger,
+};
 use rate_limit::{add_rate_usage, advance_rate_limit_bucket};
 
 const IMAGE_GENERATION_WORKFLOW_INSTRUCTIONS: &str = concat!(
@@ -321,22 +326,41 @@ async fn deliver_response(
     sent_via_discord_tool: Option<DiscordSendRecord>,
     generated_images: Vec<Vec<u8>>,
 ) -> Result<(), serenity::Error> {
+    let has_generated_images = generated_images.iter().any(|image| !image.is_empty());
+    let has_visible_output =
+        !text.trim().is_empty() || has_generated_images || sent_via_discord_tool.is_some();
+    let footer = if has_visible_output { footer } else { "" };
+
     if let Some(modal) = origin.modal_ephemeral_delivery() {
         if let Some(sent) = sent_via_discord_tool {
             if sent.private {
                 debug!(
                     "Skipping final assistant send because discord-tool already sent an ephemeral interaction response"
                 );
-                send_modal_ephemeral_response(http, &modal.interaction, &sent.content, footer)
-                    .await?;
-                send_modal_generated_images(http, &modal.interaction, generated_images).await?;
+                let response_footer = if has_generated_images { "" } else { footer };
+                send_modal_ephemeral_response(
+                    http,
+                    &modal.interaction,
+                    &sent.content,
+                    response_footer,
+                )
+                .await?;
+                if has_generated_images {
+                    send_modal_generated_images(http, &modal.interaction, generated_images).await?;
+                    send_modal_footer(http, &modal.interaction, footer).await?;
+                }
                 return Ok(());
             }
 
             debug!(
                 "Skipping final assistant send because discord-tool already posted a public modal response"
             );
-            append_discord_tool_footer(http, channel_id, &sent, footer).await?;
+            if has_generated_images {
+                send_generated_images(http, channel_id, generated_images).await?;
+                send_footer_message(http, channel_id, footer).await?;
+            } else {
+                append_discord_tool_footer(http, channel_id, &sent, footer).await?;
+            }
             modal
                 .interaction
                 .edit_response(
@@ -345,12 +369,15 @@ async fn deliver_response(
                 )
                 .await
                 .ok();
-            send_generated_images(http, channel_id, generated_images).await?;
             return Ok(());
         }
 
-        send_modal_ephemeral_response(http, &modal.interaction, text, footer).await?;
-        send_modal_generated_images(http, &modal.interaction, generated_images).await?;
+        let response_footer = if has_generated_images { "" } else { footer };
+        send_modal_ephemeral_response(http, &modal.interaction, text, response_footer).await?;
+        if has_generated_images {
+            send_modal_generated_images(http, &modal.interaction, generated_images).await?;
+            send_modal_footer(http, &modal.interaction, footer).await?;
+        }
         return Ok(());
     }
 
@@ -367,18 +394,42 @@ async fn deliver_response(
             return Ok(());
         }
 
-        if is_same_text_loosely(&sent.content, text) {
+        let final_text_already_posted =
+            sent.suppress_final_response || is_same_text_loosely(&sent.content, text);
+        if has_generated_images {
+            if !final_text_already_posted && !text.trim().is_empty() {
+                send_long_message(http, channel_id, text, "").await?;
+            }
+            send_generated_images(http, channel_id, generated_images).await?;
+            send_footer_message(http, channel_id, footer).await?;
+            return Ok(());
+        }
+
+        if final_text_already_posted || text.trim().is_empty() {
             debug!(
-                "Skipping final assistant send because discord-tool already posted the same text"
+                "Skipping final assistant send because a Discord response tool already posted it"
             );
             append_discord_tool_footer(http, channel_id, &sent, footer).await?;
-            send_generated_images(http, channel_id, generated_images).await?;
             return Ok(());
         }
     }
 
+    if text.trim().is_empty() {
+        if has_generated_images {
+            send_generated_images(http, channel_id, generated_images).await?;
+            send_footer_message(http, channel_id, footer).await?;
+        }
+        return Ok(());
+    }
+
+    if has_generated_images {
+        send_long_message(http, channel_id, text, "").await?;
+        send_generated_images(http, channel_id, generated_images).await?;
+        send_footer_message(http, channel_id, footer).await?;
+        return Ok(());
+    }
+
     send_long_message(http, channel_id, text, footer).await?;
-    send_generated_images(http, channel_id, generated_images).await?;
     Ok(())
 }
 
@@ -388,6 +439,10 @@ async fn append_discord_tool_footer(
     sent: &DiscordSendRecord,
     footer: &str,
 ) -> Result<(), serenity::Error> {
+    if footer.is_empty() {
+        return Ok(());
+    }
+
     if let (Some(channel_id), Some(message_id)) = (sent.channel_id, sent.message_id) {
         append_footer_to_sent_message(
             http,
@@ -410,11 +465,122 @@ pub(super) fn schedule_message_response(
     msg: &Message,
     ob_context: &NelfieContext,
 ) {
+    schedule_user_message_response(ctx, msg, ob_context, UserResponseTrigger::Mention, None);
+}
+
+fn schedule_auto_replay_response(
+    ctx: &serenity::client::Context,
+    msg: &Message,
+    ob_context: &NelfieContext,
+    token: AutoReplayJudgeToken,
+) {
+    schedule_user_message_response(
+        ctx,
+        msg,
+        ob_context,
+        UserResponseTrigger::AutoReplay,
+        Some(token),
+    );
+}
+
+fn schedule_user_message_response(
+    ctx: &serenity::client::Context,
+    msg: &Message,
+    ob_context: &NelfieContext,
+    trigger: UserResponseTrigger,
+    judge_reservation: Option<AutoReplayJudgeToken>,
+) {
     schedule_response(
         ctx,
         ob_context,
-        ResponseOrigin::User(UserResponseRequest::from_message(msg)),
+        ResponseOrigin::User(UserResponseRequest::from_message(msg, trigger)),
+        judge_reservation,
     );
+}
+
+pub(super) fn schedule_auto_replay_judge(
+    ctx: &serenity::client::Context,
+    msg: &Message,
+    ob_context: &NelfieContext,
+    message_revision: u64,
+) {
+    let channel_id = msg.channel_id;
+    let now = Instant::now();
+    let now_epoch_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    let Some(token) = ob_context.chat_contexts.begin_auto_replay_judge(
+        channel_id,
+        now_epoch_secs,
+        message_revision,
+        now,
+    ) else {
+        return;
+    };
+
+    let context = ctx.clone();
+    let message = msg.clone();
+    let message_is_nelfie = msg.author.id == ctx.cache.current_user().id;
+    let message_timestamp = msg
+        .timestamp
+        .with_timezone(&chrono_tz::Asia::Tokyo)
+        .format("%Y-%m-%d %H:%M:%S JST")
+        .to_string();
+    let previous_result = token.previous_result().cloned();
+    let mut lm_context = ob_context.chat_contexts.get_or_create(channel_id);
+    let ob_context = ob_context.clone();
+    tokio::spawn(async move {
+        refresh_discord_image_urls_for_api(&context, &mut lm_context).await;
+        let current_time = chrono::Utc::now()
+            .with_timezone(&chrono_tz::Asia::Tokyo)
+            .format("%Y-%m-%d %H:%M:%S JST")
+            .to_string();
+        let judgement = timeout(
+            Duration::from_millis(ob_context.config.timeout_millis),
+            ob_context.lm_client.judge_participation(
+                &lm_context,
+                &message_timestamp,
+                &current_time,
+                message_is_nelfie,
+                previous_result.as_ref(),
+            ),
+        )
+        .await;
+
+        let decision = match judgement {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(error)) => {
+                warn!(
+                    "auto-reply Judge failed: channel={} error={}",
+                    channel_id.get(),
+                    error
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    "auto-reply Judge timed out: channel={} timeout_ms={}",
+                    channel_id.get(),
+                    ob_context.config.timeout_millis
+                );
+                None
+            }
+        };
+
+        let judged_at = chrono::Utc::now()
+            .with_timezone(&chrono_tz::Asia::Tokyo)
+            .format("%Y-%m-%d %H:%M:%S JST")
+            .to_string();
+        let should_respond = ob_context.chat_contexts.finish_auto_replay_judge(
+            channel_id,
+            &token,
+            decision,
+            Instant::now(),
+            &message_timestamp,
+            &judged_at,
+        );
+        if should_respond {
+            schedule_auto_replay_response(&context, &message, &ob_context, token);
+        }
+    });
 }
 
 pub(super) fn schedule_modal_response(
@@ -426,6 +592,7 @@ pub(super) fn schedule_modal_response(
         ctx,
         ob_context,
         ResponseOrigin::User(UserResponseRequest::from_modal(modal)),
+        None,
     );
 }
 
@@ -434,16 +601,25 @@ pub fn schedule_cron_response(
     ob_context: &NelfieContext,
     cron: CronResponseRequest,
 ) {
-    schedule_response(ctx, ob_context, ResponseOrigin::Cron(cron));
+    schedule_response(ctx, ob_context, ResponseOrigin::Cron(cron), None);
 }
 
 fn schedule_response(
     ctx: &serenity::client::Context,
     ob_context: &NelfieContext,
     origin: ResponseOrigin,
+    judge_reservation: Option<AutoReplayJudgeToken>,
 ) {
     let channel_id = origin.channel_id();
     let request_id = ob_context.response_seq.fetch_add(1, Ordering::Relaxed);
+
+    if !ob_context.chat_contexts.begin_response_inference(
+        channel_id,
+        request_id,
+        judge_reservation.as_ref(),
+    ) {
+        return;
+    }
 
     ob_context.responding_channels.insert(channel_id, true);
 
@@ -451,8 +627,10 @@ fn schedule_response(
     let ob_ctx_cloned = ob_context.clone();
     let origin_cloned = origin.clone();
     let (cancel_sender, cancel_receiver) = watch::channel(false);
+    let (start_sender, start_receiver) = oneshot::channel();
 
     let task_handle = tokio::spawn(async move {
+        let _ = start_receiver.await;
         if let Err(e) = run_response_task(
             &ctx_cloned,
             &ob_ctx_cloned,
@@ -472,6 +650,10 @@ fn schedule_response(
             );
         }
 
+        ob_ctx_cloned
+            .chat_contexts
+            .finish_response_inference(channel_id, request_id);
+
         if let Some(current) = ob_ctx_cloned.active_responses.get(&channel_id)
             && current.request_id == request_id
         {
@@ -490,6 +672,7 @@ fn schedule_response(
     if let Some(old_active) = ob_context.active_responses.insert(channel_id, new_active) {
         let _ = old_active.cancel_sender.send(true);
     }
+    let _ = start_sender.send(());
 }
 
 async fn run_response_task(
@@ -670,6 +853,10 @@ async fn run_response_task(
             channel_id,
             channel_name,
         );
+        system_prompt.push('\n');
+        system_prompt.push_str(DISCORD_HISTORY_FORMAT);
+        system_prompt.push('\n');
+        system_prompt.push_str(DISCORD_REPLY_OUTPUT_INSTRUCTIONS);
         if let Some(note) = origin.system_note() {
             system_prompt.push('\n');
             system_prompt.push_str(&note);
@@ -741,6 +928,7 @@ async fn run_response_task(
     });
 
     let context_cache_key = format!("nelfie-context-{}", channel_id.get());
+    let (reply_to_message_id, request_author_id) = origin.reply_context();
     let generate_response = ob_context.lm_client.generate_response(
         ob_context.clone(),
         &context,
@@ -751,6 +939,8 @@ async fn run_response_task(
             tools,
             progress_sender: progress_sender.clone(),
             context_cache_key,
+            reply_to_message_id,
+            request_author_id,
             parameters: model.to_parameter(),
             user_context_scope,
             allow_mainline_model_change: matches!(&origin, ResponseOrigin::User(_)),
@@ -821,11 +1011,19 @@ async fn run_response_task(
     let metrics = result.metrics;
     let result_context = result.context;
 
-    ob_context.chat_contexts.marge(channel_id, &result_context);
-
     let elapsed = start.elapsed().as_millis();
     let text = result_context.get_result();
     let sent_via_discord_tool = result_context.get_latest_discord_send_record();
+    let mut history_context = result_context.clone();
+    let public_message_is_recorded_by_discord = origin.modal_ephemeral_delivery().is_none()
+        || sent_via_discord_tool
+            .as_ref()
+            .is_some_and(|sent| !sent.private);
+    if public_message_is_recorded_by_discord {
+        history_context.remove_response_message_outputs();
+    }
+    ob_context.chat_contexts.marge(channel_id, &history_context);
+
     let total_tokens = metrics
         .total_tokens()
         .map(|tokens| tokens.to_string())

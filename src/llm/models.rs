@@ -66,7 +66,7 @@ impl Models {
     pub fn to_parameter(&self) -> ModelResponseParams {
         ModelResponseParams {
             model: self.to_string(),
-            reasoning_effort: ReasoningEffort::Low,
+            reasoning_effort: ReasoningEffort::Medium,
             features: self.features(),
         }
     }
@@ -102,21 +102,21 @@ impl From<String> for Models {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageGenerationModels {
-    GptImage25Flare,
-    GptImage25Sunburst,
+    GptImage26Flare,
+    GptImage26Sunburst,
 }
 
 impl ImageGenerationModels {
-    pub const DEFAULT: Self = Self::GptImage25Flare;
+    pub const DEFAULT: Self = Self::GptImage26Flare;
 
     pub fn list() -> [Self; 2] {
-        [Self::GptImage25Flare, Self::GptImage25Sunburst]
+        [Self::GptImage26Flare, Self::GptImage26Sunburst]
     }
 
     pub fn from_name(value: &str) -> Option<Self> {
         match value {
-            "gpt-image-2.5-flare" => Some(Self::GptImage25Flare),
-            "gpt-image-2.5-sunburst" => Some(Self::GptImage25Sunburst),
+            "gpt-image-2.6-flare" => Some(Self::GptImage26Flare),
+            "gpt-image-2.6-sunburst" => Some(Self::GptImage26Sunburst),
             _ => None,
         }
     }
@@ -131,8 +131,8 @@ impl Default for ImageGenerationModels {
 impl Display for ImageGenerationModels {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::GptImage25Flare => "gpt-image-2.5-flare",
-            Self::GptImage25Sunburst => "gpt-image-2.5-sunburst",
+            Self::GptImage26Flare => "gpt-image-2.6-flare",
+            Self::GptImage26Sunburst => "gpt-image-2.6-sunburst",
         })
     }
 }

@@ -112,7 +112,7 @@ impl LMTool for GetTime {
     }
 
     fn description(&self) -> String {
-        "Get the current time of the location based on the country code".to_string()
+        "Return the current local time for a supported country code. Each code maps to one configured time zone (for example, US is New York and AU is Sydney), so this does not resolve an arbitrary city within a country. Use for country-level time questions; unsupported codes return an error.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -121,7 +121,7 @@ impl LMTool for GetTime {
             "properties": {
                 "country_code": {
                     "type": "string",
-                    "description": "ISO 3166-1 alpha-2 country code (e.g., 'US', 'JP', 'FR')"
+                    "description": "Uppercase ISO 3166-1 alpha-2 code supported by this tool (for example, JP, US, or FR). Each country uses one configured time zone; unsupported codes return an error."
                 },
                 "$explain": {
                     "type": "string",

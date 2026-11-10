@@ -199,7 +199,7 @@ impl LMTool for VoicevoxTool {
     }
 
     fn description(&self) -> String {
-        "Control standalone VOICEVOX CORE + Discord VC reading (no external Engine server required). You can join/leave voice channels, speak text, configure auto-read and per-text-channel parallel count, register dictionary entries with the invoking user's ID recorded automatically, update guild and user voice settings (including other users), and list VOICEVOX style IDs.".to_string()
+        "Control built-in VOICEVOX playback and reading in Discord voice channels; no external VOICEVOX Engine server is needed. Use join_voice, leave_voice, or speak_text for requested live voice actions; set_* operations change playback settings, register_dictionary adds a reading rule, and list/status operations inspect available voices or runtime state. Use the current guild and voice channel unless the user specifies another. User-specific settings target the supplied user_id; dictionary entries record the invoking user's ID.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -208,7 +208,7 @@ impl LMTool for VoicevoxTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": "Operation to perform.",
+                    "description": "Choose one action: join/leave/speak in voice, change a setting, register a reading rule, inspect voice styles, or check runtime status.",
                     "enum": [
                         "join_voice",
                         "leave_voice",
@@ -234,7 +234,7 @@ impl LMTool for VoicevoxTool {
                 },
                 "text_channel_id": {
                     "type": "string",
-                    "description": "Text channel ID used for auto-read target."
+                    "description": "Discord text channel used by set_auto_read and set_parallel_read."
                 },
                 "text": {
                     "type": "string",
@@ -242,7 +242,7 @@ impl LMTool for VoicevoxTool {
                 },
                 "speaker": {
                     "type": ["integer", "string", "null"],
-                    "description": "VOICEVOX speaker ID (style ID). Null clears the setting for set_user_voice."
+                    "description": "VOICEVOX style ID used by set_speaker or set_user_voice. Null clears the user-specific setting for set_user_voice."
                 },
                 "enabled": {
                     "type": "boolean",

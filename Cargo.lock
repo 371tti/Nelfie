@@ -3864,7 +3864,7 @@ dependencies = [
 
 [[package]]
 name = "nelfie"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-openai",
  "async-trait",

@@ -486,7 +486,7 @@ impl LMTool for ModalBuilderTool {
     }
 
     fn description(&self) -> String {
-        "Build valid Discord modal definitions. Use build_modal to generate payload JSON, or build_and_send_trigger to post a stateless button that opens the modal when clicked. build_and_send_trigger stores the modal definition inside Discord custom_id, so keep title, custom_id, labels, and input IDs short and do not use placeholder/value/min_length/max_length there.".to_string()
+        "Use when the user needs a Discord form with text inputs. build_modal returns a modal definition without posting; build_and_send_trigger posts a button that opens the form and encodes its definition in the button custom_id. Keep trigger forms compact: placeholder, prefilled value, min_length, and max_length are unsupported for that operation, and all IDs and labels must fit Discord's limits.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -495,7 +495,7 @@ impl LMTool for ModalBuilderTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": "Operation to run. Use build_and_send_trigger for actual Discord-side modal opening flow. It is stateless and limited by Discord custom_id length.",
+                    "description": "Choose build_modal to return a definition only, or build_and_send_trigger to post a button that opens the form. The trigger stores the definition in custom_id and must stay compact.",
                     "enum": ["build_modal", "build_and_send_trigger"]
                 },
                 "channel_id": {

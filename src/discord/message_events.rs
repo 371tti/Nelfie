@@ -1,13 +1,13 @@
 use std::error::Error;
 
 use log::{debug, warn};
-use serenity::all::{CreateMessage, Message};
+use serenity::all::{CreateMessage, Message, UserId};
 
 use crate::{
     app::context::NelfieContext,
     discord::{
         images::{MessageImageAttachment, message_image_attachments},
-        responses::schedule_message_response,
+        responses::{schedule_auto_replay_judge, schedule_message_response},
     },
     llm::context::{LMContext, Role},
     voice::{SpeakOptions, apply_tts_dictionaries, build_tts_text_from_message},
@@ -52,11 +52,13 @@ pub(super) async fn handle_message(
     ob_context: &NelfieContext,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let channel_id = msg.channel_id;
+    let message_revision = ob_context.chat_contexts.record_incoming_message(channel_id);
     ob_context.attachment_registry.observe_message(msg);
 
     let bot_id = ctx.cache.current_user().id;
 
     let is_mentioned = msg.mentions_user_id(bot_id);
+    record_message_context(msg, ob_context, bot_id);
 
     if let Some(guild_id) = msg.guild_id
         && ob_context.chat_contexts.is_voice_auto_read(channel_id)
@@ -103,6 +105,45 @@ pub(super) async fn handle_message(
         }
     }
 
+    if msg.author.bot || msg.webhook_id.is_some() {
+        if msg.author.id == bot_id
+            && is_mentioned
+            && ob_context.chat_contexts.is_enabled(channel_id)
+            && ob_context.chat_contexts.is_auto_replay_enabled(channel_id)
+        {
+            schedule_auto_replay_judge(ctx, msg, ob_context, message_revision);
+        }
+        return Ok(());
+    }
+
+    if is_mentioned {
+        if !ob_context.chat_contexts.is_enabled(channel_id) {
+            msg.channel_id
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new().content("info: Chat context is disabled in this channel."),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        ob_context
+            .chat_contexts
+            .invalidate_auto_replay_judge(channel_id);
+        schedule_message_response(ctx, msg, ob_context);
+    } else if !msg.author.bot
+        && !msg.content.starts_with('!')
+        && ob_context.chat_contexts.is_enabled(channel_id)
+        && ob_context.chat_contexts.is_auto_replay_enabled(channel_id)
+    {
+        schedule_auto_replay_judge(ctx, msg, ob_context, message_revision);
+    }
+
+    Ok(())
+}
+
+fn record_message_context(msg: &Message, ob_context: &NelfieContext, bot_id: UserId) {
+    let channel_id = msg.channel_id;
     let image_attachments = message_image_attachments(msg);
     let image_sources = image_attachments
         .iter()
@@ -128,43 +169,54 @@ pub(super) async fn handle_message(
             .map(|reference| reference.to_json()),
     );
 
-    let content = serde_json::json!({
-        "user": msg.author.name,
-        "display_name": msg.author.display_name(),
-        "msg_id": msg.id.to_string(),
-        "reply_to": msg.referenced_message.as_ref().map_or("None".to_string(), |m| m.id.to_string()),
-        "content": msg.content,
-        "attachments": attachment_context,
-    }).to_string();
+    let message_time = msg.timestamp.with_timezone(&chrono_tz::Asia::Tokyo);
+    let message_minute = message_time.timestamp().div_euclid(60);
+    let time_marker = format!("JST {}", message_time.format("%Y-%m-%d %H:%M:%S"));
+    let mut content = format!(
+        "{} (@{}) #{}",
+        msg.author.display_name(),
+        msg.author.name,
+        msg.id
+    );
+    if let Some(reply) = msg.referenced_message.as_ref() {
+        content.push_str(&format!(" reply:#{}", reply.id));
+    }
+    content.push_str(": ");
+    content.push_str(&escape_message_line(&msg.content));
+    if !attachment_context.is_empty() {
+        content.push_str(" attachments:");
+        content.push_str(&serde_json::to_string(&attachment_context).unwrap_or_default());
+    }
     let attachment_count = msg.attachments.len();
+    let role = if msg.author.id == bot_id {
+        Role::Assistant
+    } else {
+        Role::User
+    };
 
     let mut lm_context = LMContext::new();
     if image_sources.is_empty() {
         debug!("Adding text message to context in channel {}", channel_id);
-        lm_context.add_text(content.clone(), Role::User);
+        lm_context.add_text(content, role);
     } else {
         debug!(
             "Adding image message to context in channel {} ({} attachment(s))",
             channel_id, attachment_count
         );
-        lm_context.add_user_text_with_discord_images(content.clone(), image_sources);
+        lm_context.add_text_with_discord_images(content, image_sources, role);
     }
 
-    ob_context.chat_contexts.marge(channel_id, &lm_context);
+    ob_context.chat_contexts.marge_discord_message(
+        channel_id,
+        message_minute,
+        &time_marker,
+        &lm_context,
+    );
+}
 
-    if is_mentioned {
-        if !ob_context.chat_contexts.is_enabled(channel_id) {
-            msg.channel_id
-                .send_message(
-                    &ctx.http,
-                    CreateMessage::new().content("info: Chat context is disabled in this channel."),
-                )
-                .await?;
-            return Ok(());
-        }
-
-        schedule_message_response(ctx, msg, ob_context);
-    }
-
-    Ok(())
+fn escape_message_line(content: &str) -> String {
+    content
+        .replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }

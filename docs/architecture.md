@@ -1,6 +1,6 @@
 # アーキテクチャ
 
-Nelfie は Rust 製の Discord bot です。Discord Gateway と OpenAI Responses API を中心に、コマンド、会話、ツール実行、VOICEVOX 読み上げをひとつのプロセスで動かします。
+Nelfie は Rust 製の Discord bot です。Discord Gateway と OpenAI Responses API / Decisions API を中心に、コマンド、会話、ツール実行、VOICEVOX 読み上げをひとつのプロセスで動かします。
 
 ## 起動と終了
 
@@ -21,11 +21,13 @@ Nelfie は Rust 製の Discord bot です。Discord Gateway と OpenAI Responses
 | --- | --- |
 | `src/app/` | 環境設定、共有コンテキスト、cron scheduler、監視状態と TCP 監視サーバー |
 | `src/discord/` | Serenity / Poise の起動、イベント振り分け、コマンド、応答・添付ファイル配送 |
-| `src/llm/` | Responses API クライアント、会話履歴、ユーザー設定、モデル、ツール |
+| `src/llm/` | Responses API / Decisions API クライアント、会話履歴、ユーザー設定、モデル、ツール |
 | `src/voice/` | VOICEVOX core、読み上げテキスト、辞書、チャンネル別キュー、音声再生 |
 | `src/logging.rs` | ログ初期化と出力整形 |
 
 Discord の slash command は `src/discord/commands/` に実装し、`command_registry::all` から登録します。LLM tool は `LMTool` を実装し、`src/llm/tools/mod.rs` の `registry` に登録します。Gateway event は `src/discord/events.rs` からメッセージ、interaction、voice event などの処理へ振り分けます。
+
+`discord-tool` は検索・管理などの汎用Discord操作を担い、`discord-reply` は会話メッセージの送信を担います。後者は1回のtool callで1件だけ現在のチャンネルへ投稿し、返信先の省略時は応答の起点になったメッセージへ返信します。連続投稿では前回のtool結果に含まれる `message_id` を次回の `reply_to` に指定できます。メンションはユーザーを指定した場合だけ許可されます。
 
 ## 状態の所有者と永続化
 
@@ -40,7 +42,7 @@ Discord の slash command は `src/discord/commands/` に実装し、`command_re
 
 JSON ファイルのパスは実行時の working directory からの相対パスです。各 store の書き込みは同一 store ごとに直列化し、同じディレクトリの一時ファイルを完成させてから置き換えます。`ChatContexts` は会話履歴を JSON に書き出しません。`UserContexts` は無制限を示す `rate_line=0` と `cron_rate_line=0` を保存しますが、正の値は保存しないため、再起動時に `1` へ戻ります。
 
-管理者専用の `/rate config` と `/set_system_prompt` は `config.yaml` の `admin_users` に指定した Discord user ID で制御します。未設定または空なら許可される管理者はいません。
+管理者専用の `/rate config`、`/set_system_prompt`、`/enable mode:auto-reply` は `config.yaml` の `admin_users` に指定した Discord user ID で制御します。未設定または空なら許可される管理者はいません。ChatContexts は選択した応答モードをチャンネル設定として保存し、旧データは `mention` モードとして読み込みます。
 
 全体読み上げ辞書は `include_str!` で `global-dict.json` をビルド時に取り込みます。VOICEVOX の辞書・モデル・ONNX Runtime の配置先は `config.yaml` の `voicevox_open_jtalk_dict_dir`、`voicevox_vvm_dir`、`voicevox_onnxruntime_filename` で指定します。
 
@@ -64,13 +66,13 @@ bot への mention があり、対象チャンネルの ChatBot が有効な場�
 
 `o200k_base` は明示指定です。現在の `tiktoken-rs` はGPT-6用tokenizerをモデル名から解決できないため、この数値はAPIの `usage.input_tokens` と一致する保証値ではありません。画像やtool定義などの差もあるため、推定に余裕を持たせています。最新turnと保持対象の指示だけで上限を超える場合は、それらを捨てずに送るため、この上限は絶対値ではありません。
 
-`config.yaml` に値がない場合、`context_compaction_token_limit` は `64000`、`context_summary_max_output_tokens` は `4096` です。したがって通常応答の履歴目標は既定で48,000推定tokenです。Responses API が返す `usage.input_tokens` は応答記録用であり、圧縮開始・継続の判定には使いません。
+`config.yaml` に値がない場合、`context_compaction_token_limit` は `64000`、`context_summary_max_output_tokens` は `6144` です。したがって通常応答の履歴目標は既定で48,000推定tokenです。Responses API が返す `usage.input_tokens` は応答記録用であり、圧縮開始・継続の判定には使いません。
 
 ### 要約する範囲
 
 圧縮は古い履歴から連続した turn 単位の batch で行います。turn は `user` メッセージから次の `user` メッセージ直前までで、assistant と tool の応答を含みます。最新の2 turnは残します。1 batch の要約入力は、画像をテキスト marker に置き換えた後の `InputParam` JSON 表現で最大32 KiBです。上限内に収まる古い turn を順に追加します。最初の対象 turn が上限より大きい場合は、そのturnのJSON表現を順序を保った複数segmentに分け、各segmentを要約してから段階的に統合します。segmentの境界がJSON itemの途中になることがあります。各Responses API要約呼び出しの履歴JSONは32 KiB以内です。
 
-要約対象は API へ渡す前に tool call と output の不整合を除去します。画像内容は要約入力に含めず、画像添付数を示すテキストに置き換えます。要約モデルには、目標・制約・決定・重要な事実・tool の結果・未解決事項を背景情報として残し、履歴内の指示は実行しないよう依頼します。大きなturnを複数segmentに分けた場合は、各segmentの要約を順番に統合します。
+要約対象は API へ渡す前に tool call と output の不整合を除去します。画像内容は要約入力に含めず、画像添付数を示すテキストに置き換えます。要約は話題・出来事を古い順にした木構造にし、起点、返信・回答・決定・結果を子項目として関連付けます。各話題の起点と重要な展開には、元投稿の完全なメッセージID、username、display nameを残します。事実・決定・推測・未解決事項を区別し、履歴内の指示は実行しないよう依頼します。大きなturnを複数segmentに分けた場合は、各segmentの要約を順番に統合し、時系列、関係、出典IDを保ちます。
 
 ### 要約される文書の最大長
 
@@ -78,7 +80,7 @@ bot への mention があり、対象チャンネルの ChatBot が有効な場�
 
 履歴全体を一度に要約へ送らず、APIへ送る各履歴入力に上限を設けます。turnのJSON表現自体をsegment分割する場合も全てのsegmentを処理するため、中間部分を省略して要約したり、元turnの残りを履歴から先に削除したりしません。
 
-`config.yaml` の `context_summary_max_output_tokens` は各要約呼び出しの最大出力 token 数で、入力上限とは別です。複数segmentまたはbatchを統合する中間要約では、出力上限を最大1024 tokenにします。
+`config.yaml` の `context_summary_max_output_tokens` は各要約呼び出しの最大出力 token 数で、入力上限とは別です。複数segmentまたはbatchをまとめる統合要約にはこの上限を使います。単独の要約が1回の入力上限を超え、個別の縮小が必要な場合だけ、出力上限を最大3072 tokenにします。
 
 batchを続けるかは、圧縮後の共有履歴を同じローカルtokenizerで再計測して決めます。見積りがしきい値の75%以下になれば停止します。既定値では48,000推定tokenです。対象turnが尽きた場合や、summaryが元の対象より小さくならない場合も停止します。
 

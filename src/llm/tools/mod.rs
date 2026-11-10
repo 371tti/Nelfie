@@ -4,6 +4,7 @@ use crate::llm::tool::LMTool;
 
 pub mod cron;
 pub mod discord;
+pub mod discord_reply;
 pub mod file;
 pub mod get_time;
 pub mod latex;
@@ -51,6 +52,7 @@ pub fn registry() -> HashMap<String, Box<dyn LMTool>> {
         Box::new(get_time::GetTime::new()),
         Box::new(cron::CronTool::new()),
         Box::new(discord::DiscordTool::new()),
+        Box::new(discord_reply::DiscordReplyTool),
         Box::new(file::FileTool::new()),
         Box::new(typst::TypstRenderTool::new()),
         Box::new(typst::TypstPublishTool::new()),

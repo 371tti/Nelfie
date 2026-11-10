@@ -138,7 +138,7 @@ impl LMTool for TypstRenderTool {
     }
 
     fn description(&self) -> String {
-        "Render Typst and return PNG page previews for review without posting anything to Discord. Every render gets a distinct draft_id, and its preview labels carry that ID. For a user-uploaded .typ file, pass its attachment ID as source_attachment_id; do not read or copy its source text. The selected format controls the published file. Inspect every page and warning, then pass the draft_id of the exact preview you chose to typst-publish in a later response round. Images and fonts can be passed by retained attachment IDs, including IDs returned by get_user_profile. Imports may use only official @preview packages; arbitrary URLs and host files are unavailable.".to_string()
+        "Render Typst and return PNG previews of every page; rendering does not post to Discord. For an uploaded .typ file, pass its attachment ID as source_attachment_id instead of reading or copying its text. Pass retained image/font IDs in asset_ids. Inspect all pages and warnings, then use the exact draft_id with typst-publish in a later API round only when the user asks to publish. format selects the final file; previews are always PNG. Imports are limited to official @preview packages; arbitrary URLs and host files are unavailable.".to_string()
     }
 
     fn json_schema(&self) -> Value {
@@ -288,7 +288,7 @@ impl LMTool for TypstPublishTool {
     }
 
     fn description(&self) -> String {
-        "Publish one explicitly selected Typst draft to the current Discord channel. Pass the draft_id from the exact preview you reviewed. The tool rejects unknown drafts and drafts whose previews have not been passed to the model in an earlier response round.".to_string()
+        "Publish the exact Typst draft from an earlier typst-render call to the current Discord channel. Use only after its previews were returned in an earlier API round and the user asks to post that draft. Copy its exact draft_id; this sends the selected PDF or rendered page files immediately.".to_string()
     }
 
     fn json_schema(&self) -> Value {

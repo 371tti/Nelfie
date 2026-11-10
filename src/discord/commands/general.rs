@@ -5,12 +5,41 @@ use poise::CreateReply;
 use serenity::all::{Attachment, CreateAttachment, CreateEmbed};
 
 use crate::llm::{
+    channel::ChatResponseMode,
     models::{ImageGenerationModels, Models},
     tools::latex::LatexExprRenderTool,
     user::UserContextScope,
 };
 
 use super::shared::{Context, Error, preview_text};
+
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+enum EnableMode {
+    #[name = "mention"]
+    Mention,
+    #[name = "auto-reply"]
+    AutoReplay,
+}
+
+impl EnableMode {
+    fn response_mode(self) -> ChatResponseMode {
+        match self {
+            Self::Mention => ChatResponseMode::Mention,
+            Self::AutoReplay => ChatResponseMode::AutoReplay,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::AutoReplay => "auto-reply",
+        }
+    }
+
+    fn is_authorized_for(self, user_id: u64, admin_users: &[u64]) -> bool {
+        matches!(self, Self::Mention) || admin_users.contains(&user_id)
+    }
+}
 
 /// ping pong..
 #[poise::command(slash_command, prefix_command)]
@@ -103,22 +132,47 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
 
 /// to enable nelfie bot
 #[poise::command(slash_command, prefix_command)]
-pub async fn enable(ctx: Context<'_>) -> Result<(), Error> {
+pub async fn enable(
+    ctx: Context<'_>,
+    #[description = "Response mode (default: mention)"] mode: Option<EnableMode>,
+) -> Result<(), Error> {
     let channel_id = ctx.channel_id();
-
     let ob_ctx = ctx.data();
+    let mode = mode.unwrap_or(EnableMode::Mention);
+    let response_mode = mode.response_mode();
+    let mode_name = mode.as_str();
 
-    if ob_ctx.chat_contexts.is_enabled(channel_id) {
-        ctx.say("info: このチャンネルのチャットコンテキストは既に有効です。")
+    if !mode.is_authorized_for(ctx.author().id.get(), &ob_ctx.config.admin_users) {
+        ctx.say("エラー: /enable mode:auto-reply を実行する権限がありません。")
             .await?;
-        Ok(())
-    } else {
-        ob_ctx.chat_contexts.set_enabled(channel_id, true);
-        ob_ctx.chat_contexts.get_or_create(channel_id);
-        ctx.say("info: このチャンネルのチャットコンテキストを有効化しました。")
-            .await?;
-        info!("Enabled chat context for channel {}", channel_id);
-        Ok(())
+        return Ok(());
+    }
+
+    ob_ctx
+        .chat_contexts
+        .set_response_mode(channel_id, response_mode);
+    ob_ctx.chat_contexts.get_or_create(channel_id);
+    ctx.say(format!(
+        "info: このチャンネルのチャットコンテキストを有効化しました。モード: `{}`",
+        mode_name
+    ))
+    .await?;
+    info!(
+        "Enabled chat context for channel {} with mode {}",
+        channel_id, mode_name
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnableMode;
+
+    #[test]
+    fn only_admins_can_select_auto_reply_mode() {
+        assert!(EnableMode::Mention.is_authorized_for(123, &[]));
+        assert!(!EnableMode::AutoReplay.is_authorized_for(123, &[]));
+        assert!(EnableMode::AutoReplay.is_authorized_for(123, &[123]));
     }
 }
 

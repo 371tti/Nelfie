@@ -684,7 +684,7 @@ impl LMTool for DiscordTool {
     }
 
     fn description(&self) -> String {
-        "Interact with Discord: inspect user profiles and profile images, search server members by username or nickname with online, role, and channel filters, list recent users in a channel, add/remove reactions, create threads, send/edit/fetch/search messages, send ephemeral interaction messages visible only to the current modal respondent, and inspect channels/voice presence. get_user_profile returns reusable file and Typst asset IDs for its images. Use get_user_profile with a user_id or username, search_users for server-member queries, and list_recent_users for recent channel participants. Important: when you use send_message or send_ephemeral_message, the text is already posted to Discord, so do not repeat the same body again in a normal assistant reply.".to_string()
+        "Use for Discord lookups and non-conversational actions: profiles/member/history search, reactions, threads, channel/voice listings, and message fetch/edit. Normal replies to the current channel are sent automatically from assistant text; use discord-reply only when a reply reference, user ping, or explicitly separate post is needed. Use send_message for a specifically requested target channel; it posts immediately. send_ephemeral_message requires an active interaction. Do not duplicate a post.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -693,7 +693,7 @@ impl LMTool for DiscordTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": "Discord operation to perform.",
+                    "description": "Choose exactly one Discord action. Use read/search/list operations for lookup; use send/edit/reaction/thread operations only when the requested Discord change is clear.",
                     "enum": [
                         "add_reaction",
                         "remove_reaction",
@@ -750,7 +750,7 @@ impl LMTool for DiscordTool {
                 },
                 "reply_to": {
                     "type": "string",
-                    "description": "Message ID to reply to. Optional. Used by: send_message."
+                    "description": "Optional message ID in the target channel to reply to with send_message. Omit to post without a reply."
                 },
                 "query": {
                     "type": "string",

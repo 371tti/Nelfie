@@ -53,7 +53,7 @@ impl LMTool for CronTool {
     }
 
     fn description(&self) -> String {
-        "Manage persistent scheduled LLM prompts for Discord channels. Use create to register a cron schedule, list to inspect registered schedules, and delete to remove one. Use the current guild_id and channel_id from the system context unless the user clearly requests another channel.".to_string()
+        "Manage persistent scheduled prompts for Discord. Use create only when the user asks for a scheduled or recurring action; it stores a prompt for the LLM to run and post on that schedule. Use list to inspect jobs and delete with the job ID to remove one. Schedules use server local time. Use the current guild and channel unless the user explicitly names another destination.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -62,12 +62,12 @@ impl LMTool for CronTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": "Cron schedule operation.",
+                    "description": "Choose one job action: create a scheduled prompt, list jobs, or delete a job by ID.",
                     "enum": ["create", "list", "delete"]
                 },
                 "guild_id": {
                     "type": "string",
-                    "description": "Discord guild ID. Required for create/list/delete."
+                    "description": "Discord server containing the target channel. Required for create, list, and delete."
                 },
                 "channel_id": {
                     "type": "string",
@@ -79,7 +79,7 @@ impl LMTool for CronTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt to automatically send to the LLM when the schedule fires. Used by create."
+                    "description": "Instruction the LLM will run automatically when the schedule fires. Used only by create."
                 },
                 "id": {
                     "type": "string",

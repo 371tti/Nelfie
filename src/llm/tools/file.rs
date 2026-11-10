@@ -270,7 +270,7 @@ impl LMTool for FileTool {
     }
 
     fn description(&self) -> String {
-        "List, read, or attach files from Discord messages, including reusable profile images returned by get_user_profile. Use list with a channel_id to inspect retained attachments; use read for UTF-8 text files; use attach to include a Responses API-supported file or image in the next model request. For Typst, pass image IDs from get_user_profile or file list to typst-render.asset_ids; for a .typ file, pass its attachment ID directly to typst-render.source_attachment_id instead of reading and copying the source text.".to_string()
+        "Access retained Discord message attachments and reusable profile-image assets. Use list to find attachment IDs, read to inspect UTF-8 text in chunks, or attach to add a supported file or image to the next model request. This tool does not read local paths. For Typst, pass asset IDs to typst-render.asset_ids and pass an uploaded .typ file's ID directly as source_attachment_id instead of copying its contents.".to_string()
     }
 
     fn json_schema(&self) -> Value {
@@ -279,19 +279,20 @@ impl LMTool for FileTool {
             "properties": {
                 "operation": {
                     "type": "string",
+                    "description": "Choose list to find retained attachments, read to inspect a UTF-8 text file, or attach to include a supported file or image in the next model request.",
                     "enum": ["list", "read", "attach"],
                 },
                 "channel_id": {
                     "type": "string",
-                    "description": "Optional Discord channel ID. Defaults to the current channel for list. For read/attach, omit to search retained attachment IDs across channels.",
+                    "description": "Optional Discord channel filter. list defaults to the current channel; read and attach search retained IDs across channels when omitted.",
                 },
                 "attachment_id": {
                     "type": "string",
-                    "description": "Retained Discord attachment or profile image asset ID, required for read and attach.",
+                    "description": "ID from file list or get_user_profile for a retained Discord attachment or profile image. Required for read and attach.",
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "UTF-8 byte offset returned by the previous read result.",
+                    "description": "UTF-8 byte offset for read. Use next_offset from the previous result to continue; omit to start at byte 0.",
                 },
             },
             "required": ["operation"],

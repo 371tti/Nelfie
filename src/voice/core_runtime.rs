@@ -901,7 +901,7 @@ impl CoreRuntime {
             );
         }
 
-        let mut staging = match tempfile::tempdir_in(models_root) {
+        let staging = match tempfile::tempdir_in(models_root) {
             Ok(staging) => staging,
             Err(error) if has_local_assets => {
                 warn!(

@@ -14,7 +14,8 @@ Observer-rust の後継プロジェクトとして、スタンドアローン動
     - file.rs: Discord添付ファイルの一覧・読み取り・Responses API入力
     - typst.rs: TypstからPNG・SVGページ画像またはPDFを生成
     - modal_builder.rs: ストレージなしの短い stateless trigger でモーダルダイアログを動的に構築
-    - discord.rs: Discord 操作系ツール（例: メッセージ送信、回答者限定の ephemeral 応答、チャンネル管理）
+    - discord.rs: Discord 操作系ツール（例: メッセージ検索、プロフィール、チャンネル管理）
+    - discord_reply.rs: 1回1投稿の会話返信（返信先・ユーザーメンションに対応）
     - voicevox.rs: VOICEVOX 操作系ツール（例: 話者変更、スタイル変更、読み上げ）
 - VOICEVOX 読み上げ: VC内でのテキスト読み上げ機能 話者・スタイル選択可能 自動読み上げ機能
 - TeX 数式の画像化: TeX 数式を画像化して Discord に送信する機能
@@ -107,7 +108,8 @@ BASIC:
 
 CHAT BOT:
 
-- `/enable`: ChatBot 機能を有効化
+- `/enable mode:<mention|auto-reply>`: ChatBot 機能を有効化します。`mode` 省略時は `mention`（メンション時のみ応答）、`auto-reply` は会話をDecisions APIで判定して自動応答します。`auto-reply` は管理者のみ指定できます。
+- JudgeはDecisions APIを使い、チャンネルごとに10秒あたり1回までです。チャンネル内で通常返信やJudgeの推論中は、追加のJudgeを開始しません。`sleep` 判定では監視を1分から始め、連続するsleep判定ごとに2倍、最大32分まで停止します。Judgeが `respond` と判定すると1分に戻ります。
 - `/disable`: ChatBot 機能を無効化
 - `/clear`: 会話履歴をクリア
 - `/model`: 使用する OpenAI モデルを選択
@@ -143,7 +145,7 @@ cron は実行環境のローカル時刻で、標準的な 5 フィールド表
 
 Mainline LLM の利用可能なモデルは `gpt-6-luna` のみです。モデル選択コマンドと選択状態は維持しており、現在は同じモデルを選択できます。画像生成モデルの選択肢はこの制限の対象外です。アプリのレート制限は実際のtoken数ではなく、モデルごとの固定コスト係数を使います。実際のAPI請求額はtoken数や長文context向け価格によって変わります。モデル一覧と現在モデルでは、レート制限で消費するコストを `xN` 形式で表示します。ユーザー既定、システム、cron、context要約のモデルは `Models` の `USER_DEFAULT_MODEL`、`SYSTEM_MODEL`、`CRON_MODEL`、`CONTEXT_SUMMARY_MODEL` で用途別に定義します。現在はいずれも `gpt-6-luna` です。
 
-`model-control` ツールで mainline Responses モデルと画像生成モデルを切り替えられます。画像生成モデルの初期値は `gpt-image-2.5-flare` です。画像生成前にモデル設定を読み取るか変更し、次のResponses APIラウンドで設定済みモデルを使うネイティブ `image_generation` ツールを有効にします。推論レベルは常に `low` です。画像生成の開始1回ごとに追加でレート枠を1単位消費します。スラッシュコマンドでは `/model get` と `/model image-set` で確認・変更できます。
+`model-control` ツールで mainline Responses モデルと画像生成モデルを切り替えられます。画像生成モデルの初期値は `gpt-image-2.6-flare` です。画像生成前にモデル設定を読み取るか変更し、次のResponses APIラウンドで設定済みモデルを使うネイティブ `image_generation` ツールを有効にします。推論レベルは常に `low` です。画像生成の開始1回ごとに追加でレート枠を1単位消費します。スラッシュコマンドでは `/model get` と `/model image-set` で確認・変更できます。
 
 通常応答はチャンネルごとに安定した`prompt_cache_key`を送信して、同じ会話contextのprefix cacheを再利用します。5.6系モデルではさらに`prompt_cache_retention=24h`を明示してextended prompt cacheを有効化します。GPT-6系モデルはAPIの標準cache制御を使います。APIが返す`cached_tokens`はtool-callを含む全ラウンドで集計し、応答完了ログへ`prompt_cache=hit`または`prompt_cache=miss`とともに表示します。
 

@@ -80,6 +80,19 @@ pub(super) async fn send_generated_images(
     Ok(())
 }
 
+pub(super) async fn send_footer_message(
+    http: &serenity::http::Http,
+    channel_id: serenity::all::ChannelId,
+    footer: &str,
+) -> Result<(), serenity::Error> {
+    if !footer.is_empty() {
+        channel_id
+            .send_message(http, CreateMessage::new().content(footer))
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn send_typst_pages(
     http: &serenity::http::Http,
     channel_id: serenity::all::ChannelId,
@@ -133,6 +146,24 @@ pub(super) async fn send_modal_generated_images(
             .add_file(attachment)
             .ephemeral(true);
         modal.create_followup(http, followup).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn send_modal_footer(
+    http: &serenity::http::Http,
+    modal: &ModalInteraction,
+    footer: &str,
+) -> Result<(), serenity::Error> {
+    if !footer.is_empty() {
+        modal
+            .create_followup(
+                http,
+                CreateInteractionResponseFollowup::new()
+                    .content(footer)
+                    .ephemeral(true),
+            )
+            .await?;
     }
     Ok(())
 }

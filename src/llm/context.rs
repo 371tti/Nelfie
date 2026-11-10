@@ -27,6 +27,7 @@ pub struct DiscordSendRecord {
     pub private: bool,
     pub channel_id: Option<u64>,
     pub message_id: Option<u64>,
+    pub suppress_final_response: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -346,7 +347,23 @@ impl LMContext {
         self.buf.push_back(text_message_item(text, role));
     }
 
-    pub fn add_user_text_with_images(&mut self, text: String, image_urls: Vec<String>) {
+    pub fn remove_response_message_outputs(&mut self) {
+        self.buf
+            .retain(|item| !matches!(item, InputItem::Item(Item::Message(MessageItem::Output(_)))));
+    }
+
+    pub fn add_text_with_images(&mut self, text: String, image_urls: Vec<String>, role: Role) {
+        let input_role = match role {
+            Role::System => InputRole::System,
+            Role::Developer => InputRole::Developer,
+            Role::User => InputRole::User,
+            Role::Assistant => {
+                // The Responses API has no multimodal assistant input role.
+                self.add_text(text, Role::Assistant);
+                return;
+            }
+        };
+
         let mut contents = vec![InputContent::from(text)];
         for url in image_urls {
             contents.push(InputContent::InputImage(InputImageContent {
@@ -360,10 +377,14 @@ impl LMContext {
             .push_back(InputItem::Item(Item::Message(MessageItem::Input(
                 InputMessage {
                     content: contents,
-                    role: InputRole::User,
+                    role: input_role,
                     status: None,
                 },
             ))));
+    }
+
+    pub fn add_user_text_with_images(&mut self, text: String, image_urls: Vec<String>) {
+        self.add_text_with_images(text, image_urls, Role::User);
     }
 
     pub fn add_user_text_with_discord_images(
@@ -371,9 +392,21 @@ impl LMContext {
         text: String,
         images: Vec<DiscordImageSource>,
     ) {
+        self.add_text_with_discord_images(text, images, Role::User);
+    }
+
+    pub fn add_text_with_discord_images(
+        &mut self,
+        text: String,
+        images: Vec<DiscordImageSource>,
+        role: Role,
+    ) {
+        let retain_image_sources = !matches!(&role, &Role::Assistant);
         let image_urls = images.iter().map(|image| image.url.clone()).collect();
-        self.add_user_text_with_images(text, image_urls);
-        self.discord_image_sources.extend(images);
+        self.add_text_with_images(text, image_urls, role);
+        if retain_image_sources {
+            self.discord_image_sources.extend(images);
+        }
     }
 
     pub fn replace_image_url(&mut self, old_url: &str, new_url: &str) {
@@ -447,19 +480,11 @@ impl LMContext {
                 return None;
             };
 
-            if call.name != "discord-tool" {
+            if call.name != "discord-tool" && call.name != "discord-reply" {
                 return None;
             }
 
             let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
-            let operation = args.get("operation").and_then(|v| v.as_str());
-            let private = match operation {
-                Some("send_message") => false,
-                Some("send_ephemeral_message") => true,
-                _ => return None,
-            };
-
-            let content = args.get("content").and_then(|v| v.as_str())?.to_string();
             let tool_output = self.buf.iter().rev().find_map(|item| {
                 let InputItem::Item(Item::FunctionCallOutput(output)) = item else {
                     return None;
@@ -472,14 +497,10 @@ impl LMContext {
                 };
                 serde_json::from_str::<serde_json::Value>(output).ok()
             });
-            if tool_output
+            let status = tool_output
                 .as_ref()
                 .and_then(|output| output.get("status"))
-                .and_then(serde_json::Value::as_str)
-                != Some("ok")
-            {
-                return None;
-            }
+                .and_then(serde_json::Value::as_str);
             let read_snowflake = |key: &str| {
                 tool_output
                     .as_ref()
@@ -490,11 +511,41 @@ impl LMContext {
                             .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
                     })
             };
+
+            if call.name == "discord-reply" {
+                if status != Some("ok") {
+                    return None;
+                }
+                return Some(DiscordSendRecord {
+                    content: tool_output
+                        .as_ref()
+                        .and_then(|output| output.get("content"))
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string(),
+                    private: false,
+                    channel_id: read_snowflake("channel_id"),
+                    message_id: read_snowflake("message_id"),
+                    suppress_final_response: true,
+                });
+            }
+
+            let operation = args.get("operation").and_then(|v| v.as_str());
+            let private = match operation {
+                Some("send_message") => false,
+                Some("send_ephemeral_message") => true,
+                _ => return None,
+            };
+            if status != Some("ok") {
+                return None;
+            }
+            let content = args.get("content").and_then(|v| v.as_str())?.to_string();
+
             Some(DiscordSendRecord {
                 content,
                 private,
                 channel_id: read_snowflake("channel_id"),
                 message_id: read_snowflake("message_id"),
+                suppress_final_response: false,
             })
         })
     }
@@ -628,7 +679,7 @@ fn chunk_oversized_turn_context(items: &[InputItem], max_bytes: usize) -> Vec<LM
                 let mut context = LMContext::new();
                 context.add_text(
                     format!(
-                        "Ordered segment {} of {} from the earliest historical turn. The body \
+                        "Chronological source segment {} of {} from the earlier conversation history. The body \
                          continues across segments and boundaries may occur inside serialized \
                          JSON. Use this segment only as source material; combine facts in segment \
                          order.\n\n{}",

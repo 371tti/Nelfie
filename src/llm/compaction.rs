@@ -13,7 +13,7 @@ use crate::llm::{
     models::Models,
 };
 
-const INTERMEDIATE_SUMMARY_MAX_OUTPUT_TOKENS: u32 = 1_024;
+const SUMMARY_REDUCTION_MAX_OUTPUT_TOKENS: u32 = 3_072;
 
 enum CompactionRun {
     Complete {
@@ -197,7 +197,7 @@ async fn summarize_compaction(
                     .summarize_context(
                         &summary_context_for_texts(std::slice::from_ref(summary)),
                         max_output_tokens
-                            .min(INTERMEDIATE_SUMMARY_MAX_OUTPUT_TOKENS)
+                            .min(SUMMARY_REDUCTION_MAX_OUTPUT_TOKENS)
                             .max(1),
                     )
                     .await?;
@@ -226,12 +226,9 @@ async fn summarize_compaction(
                 continue;
             }
             let summary_context = summary_context_for_texts(&group);
-            let intermediate_output_tokens = max_output_tokens
-                .min(INTERMEDIATE_SUMMARY_MAX_OUTPUT_TOKENS)
-                .max(1);
             let result = context
                 .lm_client
-                .summarize_context(&summary_context, intermediate_output_tokens)
+                .summarize_context(&summary_context, max_output_tokens)
                 .await?;
             merged.push(result.text);
         }
@@ -250,7 +247,7 @@ fn summary_context_for_texts(texts: &[String]) -> LMContext {
     let mut context = LMContext::new();
     for (index, text) in texts.iter().enumerate() {
         context.add_text(
-            format!("Ordered summary segment {}:\n{text}", index + 1),
+            format!("Earlier-to-later summary segment {}:\n{text}", index + 1),
             Role::User,
         );
     }

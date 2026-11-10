@@ -200,7 +200,7 @@ impl LMTool for LatexExprRenderTool {
     }
 
     fn description(&self) -> String {
-        "Render LaTeX expressions to images and send to Discord. Use this whenever you need to present a mathematical expression or formula to the user instead of emitting raw LaTeX in chat.".to_string()
+        "Render a mathematical expression as a PNG and post it immediately to the specified Discord channel, optionally as a reply. Use when the formula should be presented as an image; simple inline math can stay in text. Do not make a duplicate Discord post after this tool succeeds.".to_string()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -209,11 +209,11 @@ impl LMTool for LatexExprRenderTool {
             "properties": {
                 "channel_id": {
                     "type": "string",
-                    "description": "ID of the target channel on Discord."
+                    "description": "Discord channel ID where the rendered PNG will be posted; use the current channel unless another is requested."
                 },
                 "reply_to": {
                     "type": "string",
-                    "description": "Optional message ID to reply to."
+                    "description": "Optional message ID in the target channel to reply to. Omit for a standalone post."
                 },
                 "expression": {
                     "type": "string",
